@@ -12,6 +12,33 @@ server = app.server
 # Global state for storing scenarios
 stored_scenarios = {}
 
+# Federal tax brackets for 2023 - Married Filing Jointly
+TAX_BRACKETS_MFJ = [
+    (0, 22000, 0.10),        # 10% bracket
+    (22000, 89450, 0.12),    # 12% bracket
+    (89450, 190750, 0.22),   # 22% bracket
+    (190750, 364200, 0.24),  # 24% bracket
+    (364200, 462500, 0.32),  # 32% bracket
+    (462500, 693750, 0.35),  # 35% bracket
+    (693750, float('inf'), 0.37)  # 37% bracket
+]
+
+# Function to calculate income tax based on brackets
+def calculate_income_tax(annual_income, brackets=TAX_BRACKETS_MFJ):
+    """Calculate income tax based on tax brackets."""
+    # Ensure income is a float
+    annual_income = float(annual_income)
+    
+    total_tax = 0.0
+    for min_val, max_val, rate in brackets:
+        if annual_income <= min_val:
+            break
+        taxable_amount = min(annual_income, max_val) - min_val
+        tax_for_bracket = taxable_amount * rate
+        total_tax += tax_for_bracket
+    
+    return total_tax
+
 # Mortgage calculator functions
 def calculate_mortgage_payment(principal, annual_rate, term_years):
     """Calculate the monthly mortgage payment."""
@@ -158,12 +185,16 @@ def create_comparison_data(
     existing_house_appreciation_rate=0.03,  # Default 3% annual appreciation for existing house
     securities_value=0, securities_growth_rate=0, securities_sell_month=0,
     securities_monthly_sell=0,  # Amount of securities to sell per month
+    securities_quarterly_dividend=0,  # Quarterly dividend payment from securities
+    securities_dividend_to_savings=True,  # Whether to automatically deposit dividends to savings
     savings_initial=0, savings_interest_rate=0, # Savings account
     home_appreciation_rate=0.03,  # Default 3% annual appreciation for new house
     inflation_rate=0.0,  # Annual inflation rate (default 0%)
     apply_inflation_to_income=False,  # Whether to adjust income for inflation
     apply_inflation_to_expenses=False,  # Whether to adjust expenses for inflation
     apply_inflation_to_rent=False,  # Whether to adjust rental income for inflation
+    apply_income_tax=False,  # Whether to apply income tax 
+    tax_brackets=TAX_BRACKETS_MFJ,  # Tax brackets to use
 ):
     """Create comparison data for different mortgage funding strategies."""
     # Safety checks and defaults for None values
@@ -191,6 +222,10 @@ def create_comparison_data(
         securities_sell_month = 0
     if securities_monthly_sell is None:
         securities_monthly_sell = 0
+    if securities_quarterly_dividend is None:
+        securities_quarterly_dividend = 0
+    if securities_dividend_to_savings is None:
+        securities_dividend_to_savings = True
     if savings_initial is None:
         savings_initial = 0
     if savings_interest_rate is None:
@@ -207,6 +242,8 @@ def create_comparison_data(
         apply_inflation_to_expenses = False
     if apply_inflation_to_rent is None:
         apply_inflation_to_rent = False
+    if apply_income_tax is None:
+        apply_income_tax = False
 
     # Convert numeric values to float
     principal = float(principal)
@@ -220,6 +257,7 @@ def create_comparison_data(
     securities_value = float(securities_value)
     securities_growth_rate = float(securities_growth_rate)
     securities_monthly_sell = float(securities_monthly_sell)
+    securities_quarterly_dividend = float(securities_quarterly_dividend)
     savings_initial = float(savings_initial)
     savings_interest_rate = float(savings_interest_rate)
     home_appreciation_rate = float(home_appreciation_rate)
@@ -229,6 +267,8 @@ def create_comparison_data(
     apply_inflation_to_income = bool(apply_inflation_to_income)
     apply_inflation_to_expenses = bool(apply_inflation_to_expenses)
     apply_inflation_to_rent = bool(apply_inflation_to_rent)
+    apply_income_tax = bool(apply_income_tax)
+    securities_dividend_to_savings = bool(securities_dividend_to_savings)
 
     # Avoid division by zero
     if term_years == 0:
@@ -284,12 +324,23 @@ def create_comparison_data(
     rent_monthly_cashflow = [0] * (len(months))
     securities_monthly_cashflow = [0] * (len(months))
     combo_monthly_cashflow = [0] * (len(months))
-
+    
+    # Track taxes paid monthly
+    income_tax_paid = [0] * (len(months))
+    house_sell_tax_paid = [0] * (len(months))
+    rent_tax_paid = [0] * (len(months))
+    securities_tax_paid = [0] * (len(months))
+    combo_tax_paid = [0] * (len(months))
+    
     # Create arrays to track inflation-adjusted values over time
     inflation_adjusted_income = [monthly_income] * (len(months))
     inflation_adjusted_expenses = [monthly_expenses] * (len(months))
     inflation_adjusted_rent = [existing_house_rent_income] * (len(months))
     inflation_adjusted_values = [1.0] * (len(months))  # Inflation impact multiplier (1.0 = no impact)
+    
+    # Track quarterly dividends
+    securities_quarterly_dividend_paid = [0] * (len(months))
+    is_dividend_month = lambda m: m > 0 and m % 3 == 0  # Quarters at months 3, 6, 9, 12, etc.
 
     # Calculate data for each month
     for month in range(1, int(n_payments) + 1):
@@ -315,6 +366,13 @@ def create_comparison_data(
             inflation_adjusted_rent[month] = existing_house_rent_income * inflation_adjusted_values[month]
         else:
             inflation_adjusted_rent[month] = existing_house_rent_income
+        
+        # Calculate quarterly dividends for this month, if applicable
+        if is_dividend_month(month) and securities_quarterly_dividend > 0:
+            # Calculate dividend amount (proportional to current securities value)
+            securities_quarterly_dividend_paid[month] = securities_quarterly_dividend
+        else:
+            securities_quarterly_dividend_paid[month] = 0
 
         # Calculate monthly savings (income after expenses and mortgage payment)
         monthly_savings_rate = savings_interest_rate / 12
@@ -325,21 +383,54 @@ def create_comparison_data(
         principal_payment = monthly_payment - interest_payment
         new_balance = max(0, prev_balance - principal_payment)
         income_remaining_balance[month] = new_balance
+        
+        # Get dividend for this month
+        current_dividend = securities_quarterly_dividend_paid[month]
 
         # Update securities with growth rate
         income_securities_value[month] = income_securities_value[month-1] * (1 + securities_growth_rate / 12)
-
+        
+        # Calculate pre-tax income
+        total_monthly_pretax_income = inflation_adjusted_income[month] + current_dividend
+        
+        # Calculate income tax if enabled
+        monthly_tax = 0
+        if apply_income_tax:
+            # Calculate annual income including dividends
+            securities_annual_dividend = securities_quarterly_dividend * 4
+            annual_pretax_income = inflation_adjusted_income[month] * 12 + securities_annual_dividend
+                                 
+            # Calculate tax and divide by 12 for monthly tax
+            annual_tax = calculate_income_tax(annual_pretax_income, tax_brackets)
+            monthly_tax = annual_tax / 12
+            
+            # Store tax paid
+            income_tax_paid[month] = monthly_tax
+        
+        # Calculate after-tax income
+        total_monthly_income = total_monthly_pretax_income - monthly_tax
+        
         # Calculate savings (monthly leftover cash + interest on existing savings)
         interest_earned = income_savings_value[month-1] * monthly_savings_rate
-        monthly_leftover = inflation_adjusted_income[month] - inflation_adjusted_expenses[month] - monthly_payment
+        monthly_leftover = total_monthly_income - inflation_adjusted_expenses[month] - monthly_payment
 
         # Track total monthly cash flow (positive numbers are money going in, negative are money going out)
         income_monthly_cashflow[month] = monthly_leftover + interest_earned
-
-        if monthly_leftover > 0:
-            income_savings_value[month] = income_savings_value[month-1] * (1 + monthly_savings_rate) + monthly_leftover
+        
+        # Apply dividend to savings account if option enabled
+        if securities_dividend_to_savings and current_dividend > 0:
+            # Interest is applied first, then dividend is added
+            income_savings_value[month] = income_savings_value[month-1] * (1 + monthly_savings_rate) + current_dividend
         else:
-            income_savings_value[month] = max(0, income_savings_value[month-1] * (1 + monthly_savings_rate) + monthly_leftover)
+            # No dividend to add to savings
+            income_savings_value[month] = income_savings_value[month-1] * (1 + monthly_savings_rate)
+            
+        # Add monthly leftover to savings
+        if monthly_leftover > 0:
+            income_savings_value[month] += monthly_leftover
+        else:
+            # Withdraw from savings if needed (ensure we don't go below zero)
+            income_savings_value[month] = max(0, income_savings_value[month] + monthly_leftover)
 
         current_equity = current_property_value - new_balance
         current_existing_house_value = existing_house_values[month]
@@ -348,6 +439,9 @@ def create_comparison_data(
 
         # Strategy 2: Sell existing house
         prev_balance = house_sell_remaining_balance[month-1]
+        
+        # Get dividend for this month
+        current_dividend = securities_quarterly_dividend_paid[month]
 
         # Update securities with growth rate
         house_sell_securities_value[month] = house_sell_securities_value[month-1] * (1 + securities_growth_rate / 12)
@@ -356,9 +450,29 @@ def create_comparison_data(
         principal_payment = monthly_payment - interest_payment
         new_balance = max(0, prev_balance - principal_payment)
         house_sell_remaining_balance[month] = new_balance
+        
+        # Calculate pre-tax income
+        total_monthly_pretax_income = inflation_adjusted_income[month] + current_dividend
+        
+        # Calculate income tax if enabled
+        monthly_tax = 0
+        if apply_income_tax:
+            # Calculate annual income including dividends
+            securities_annual_dividend = securities_quarterly_dividend * 4
+            annual_pretax_income = inflation_adjusted_income[month] * 12 + securities_annual_dividend
+                                
+            # Calculate tax and divide by 12 for monthly tax
+            annual_tax = calculate_income_tax(annual_pretax_income, tax_brackets)
+            monthly_tax = annual_tax / 12
+            
+            # Store tax paid
+            house_sell_tax_paid[month] = monthly_tax
+            
+        # Calculate after-tax income
+        total_monthly_income = total_monthly_pretax_income - monthly_tax
 
-        # Calculate monthly leftover cash
-        monthly_leftover = inflation_adjusted_income[month] - inflation_adjusted_expenses[month] - monthly_payment
+        # Calculate monthly leftover cash (after tax)
+        monthly_leftover = total_monthly_income - inflation_adjusted_expenses[month] - monthly_payment
         
         # Apply interest to savings
         interest_earned = house_sell_savings_value[month-1] * monthly_savings_rate
@@ -366,12 +480,16 @@ def create_comparison_data(
         # Initialize this month's savings with previous month plus interest
         house_sell_savings_value[month] = house_sell_savings_value[month-1] * (1 + monthly_savings_rate)
         
+        # Apply dividend to savings account if option enabled
+        if securities_dividend_to_savings and current_dividend > 0:
+            house_sell_savings_value[month] += current_dividend
+        
         # Process house sale (negative months mean don't sell)
         if month == existing_house_sell_month and existing_house_sell_month >= 0:
             # Get the current value of the existing house with appreciation
             current_existing_house_value = existing_house_values[month]
             
-            # Add house sale proceeds to savings
+            # Add house sale proceeds to savings (could add capital gains tax here in the future)
             house_sell_savings_value[month] += current_existing_house_value
 
         # Add monthly leftovers to savings
@@ -395,11 +513,36 @@ def create_comparison_data(
         # Strategy 3: Rent existing house
         prev_balance = rent_remaining_balance[month-1]
         interest_payment = prev_balance * (annual_rate / 12)
+        
+        # Get dividend for this month
+        current_dividend = securities_quarterly_dividend_paid[month]
 
         # Update securities with growth rate
         rent_securities_value[month] = rent_securities_value[month-1] * (1 + securities_growth_rate / 12)
+        
+        # Calculate pre-tax income (now including rental income)
+        total_monthly_pretax_income = inflation_adjusted_income[month] + inflation_adjusted_rent[month] + current_dividend
+        
+        # Calculate income tax if enabled
+        monthly_tax = 0
+        if apply_income_tax:
+            # Calculate annual income including rental income and dividends
+            securities_annual_dividend = securities_quarterly_dividend * 4
+            annual_rental_income = inflation_adjusted_rent[month] * 12
+            annual_pretax_income = inflation_adjusted_income[month] * 12 + annual_rental_income + securities_annual_dividend
+                                
+            # Calculate tax and divide by 12 for monthly tax
+            annual_tax = calculate_income_tax(annual_pretax_income, tax_brackets)
+            monthly_tax = annual_tax / 12
+            
+            # Store tax paid
+            rent_tax_paid[month] = monthly_tax
+            
+        # Calculate after-tax income
+        total_monthly_income = total_monthly_pretax_income - monthly_tax
 
-        # Additional income from rent (inflation-adjusted)
+        # Additional income from rent can still be applied directly to mortgage
+        # (Note: we're applying rental income both to mortgage and for tax calculation)
         additional_payment = inflation_adjusted_rent[month]
         principal_payment = monthly_payment - interest_payment + additional_payment
         new_balance = max(0, prev_balance - principal_payment)
@@ -407,15 +550,27 @@ def create_comparison_data(
 
         # Calculate savings (monthly leftover cash + interest on existing savings)
         interest_earned = rent_savings_value[month-1] * monthly_savings_rate
-        monthly_leftover = inflation_adjusted_income[month] - inflation_adjusted_expenses[month] - monthly_payment + inflation_adjusted_rent[month]
-
+        
+        # Leftover is after-tax income minus expenses and mortgage payment
+        # (don't include rent in leftover calculation since it was already applied to mortgage)
+        monthly_leftover = inflation_adjusted_income[month] - inflation_adjusted_expenses[month] - monthly_payment - monthly_tax
+        
         # Track total monthly cash flow
         rent_monthly_cashflow[month] = monthly_leftover + interest_earned
+        
+        # Apply interest to savings first
+        rent_savings_value[month] = rent_savings_value[month-1] * (1 + monthly_savings_rate)
+        
+        # Apply dividend to savings account if option enabled
+        if securities_dividend_to_savings and current_dividend > 0:
+            rent_savings_value[month] += current_dividend
 
+        # Add monthly leftovers to savings
         if monthly_leftover > 0:
-            rent_savings_value[month] = rent_savings_value[month-1] * (1 + monthly_savings_rate) + monthly_leftover
+            rent_savings_value[month] += monthly_leftover
         else:
-            rent_savings_value[month] = max(0, rent_savings_value[month-1] * (1 + monthly_savings_rate) + monthly_leftover)
+            # If negative leftover (drawing from savings), ensure we don't go below zero
+            rent_savings_value[month] = max(0, rent_savings_value[month] + monthly_leftover)
 
         current_equity = current_property_value - new_balance
         current_existing_house_value = existing_house_values[month]
@@ -425,6 +580,9 @@ def create_comparison_data(
         # Strategy 4: Sell securities
         prev_balance = securities_remaining_balance[month-1]
         interest_payment = prev_balance * (annual_rate / 12)
+        
+        # Get dividend for this month
+        current_dividend = securities_quarterly_dividend_paid[month]
 
         # Get securities value from previous month
         temp_securities_value = securities_securities_value[month-1]
@@ -453,19 +611,45 @@ def create_comparison_data(
 
         # Store the updated securities value
         securities_securities_value[month] = temp_securities_value
+        
+        # Calculate pre-tax income (including capital gains from securities sales)
+        total_monthly_pretax_income = inflation_adjusted_income[month] + current_dividend
+        
+        # Calculate income tax if enabled
+        monthly_tax = 0
+        if apply_income_tax:
+            # Calculate annual income including dividends
+            securities_annual_dividend = securities_quarterly_dividend * 4
+            annual_pretax_income = inflation_adjusted_income[month] * 12 + securities_annual_dividend
+            # Note: Capital gains from securities sales could be taxed differently
+            # but for simplicity we're not including it in this basic model
+                                
+            # Calculate tax and divide by 12 for monthly tax
+            annual_tax = calculate_income_tax(annual_pretax_income, tax_brackets)
+            monthly_tax = annual_tax / 12
+            
+            # Store tax paid
+            securities_tax_paid[month] = monthly_tax
+            
+        # Calculate after-tax income
+        total_monthly_income = total_monthly_pretax_income - monthly_tax
 
         principal_payment = monthly_payment - interest_payment
         new_balance = max(0, prev_balance - principal_payment)
         securities_remaining_balance[month] = new_balance
 
-        # Calculate monthly leftover cash
-        monthly_leftover = inflation_adjusted_income[month] - inflation_adjusted_expenses[month] - monthly_payment
+        # Calculate monthly leftover cash (after tax)
+        monthly_leftover = total_monthly_income - inflation_adjusted_expenses[month] - monthly_payment
         
         # Apply interest to savings
         interest_earned = securities_savings_value[month-1] * monthly_savings_rate
         
         # Initialize this month's savings with previous month plus interest
         securities_savings_value[month] = securities_savings_value[month-1] * (1 + monthly_savings_rate)
+        
+        # Apply dividend to savings account if option enabled
+        if securities_dividend_to_savings and current_dividend > 0:
+            securities_savings_value[month] += current_dividend
         
         # Apply securities proceeds to savings account
         if monthly_sell_amount > 0:
@@ -489,6 +673,9 @@ def create_comparison_data(
         # Strategy 5: Combination - Rent existing house AND sell securities
         prev_balance = combo_remaining_balance[month-1]
         interest_payment = prev_balance * (annual_rate / 12)
+        
+        # Get dividend for this month
+        current_dividend = securities_quarterly_dividend_paid[month]
         
         # Get securities value from previous month
         temp_securities_value = combo_securities_value[month-1]
@@ -523,22 +710,49 @@ def create_comparison_data(
         if existing_house_sell_month >= 0 and month >= existing_house_sell_month:
             house_is_owned = False
             
-        # Additional income from rent (inflation-adjusted) - only if house is still owned
-        additional_payment = inflation_adjusted_rent[month] if house_is_owned else 0
+        # Calculate rental income (only if house is still owned)
+        rental_income = inflation_adjusted_rent[month] if house_is_owned else 0
         
-        principal_payment = monthly_payment - interest_payment
+        # Calculate pre-tax income (including rental income and dividends)
+        total_monthly_pretax_income = inflation_adjusted_income[month] + rental_income + current_dividend
+        
+        # Calculate income tax if enabled
+        monthly_tax = 0
+        if apply_income_tax:
+            # Calculate annual income including rental income and dividends
+            securities_annual_dividend = securities_quarterly_dividend * 4
+            annual_rental_income = rental_income * 12
+            annual_pretax_income = inflation_adjusted_income[month] * 12 + annual_rental_income + securities_annual_dividend
+                                
+            # Calculate tax and divide by 12 for monthly tax
+            annual_tax = calculate_income_tax(annual_pretax_income, tax_brackets)
+            monthly_tax = annual_tax / 12
+            
+            # Store tax paid
+            combo_tax_paid[month] = monthly_tax
+            
+        # Calculate after-tax income
+        total_monthly_income = total_monthly_pretax_income - monthly_tax
+        
+        # Additional payment for mortgage (apply rental income directly to principal)
+        additional_payment = rental_income
+        
+        principal_payment = monthly_payment - interest_payment + additional_payment
         new_balance = max(0, prev_balance - principal_payment)
         combo_remaining_balance[month] = new_balance
         
-        # Calculate monthly leftover cash with rental income (only if house is still owned)
-        rental_income = inflation_adjusted_rent[month] if house_is_owned else 0
-        monthly_leftover = inflation_adjusted_income[month] - inflation_adjusted_expenses[month] - monthly_payment + rental_income
+        # Calculate monthly leftover cash (after tax and excluding rental income directly applied to mortgage)
+        monthly_leftover = inflation_adjusted_income[month] - inflation_adjusted_expenses[month] - monthly_payment - monthly_tax
         
         # Apply interest to savings
         interest_earned = combo_savings_value[month-1] * monthly_savings_rate
         
         # Initialize this month's savings with previous month plus interest
         combo_savings_value[month] = combo_savings_value[month-1] * (1 + monthly_savings_rate)
+        
+        # Apply dividend to savings account if option enabled
+        if securities_dividend_to_savings and current_dividend > 0:
+            combo_savings_value[month] += current_dividend
         
         # Apply securities proceeds to savings account
         if monthly_sell_amount > 0:
@@ -597,6 +811,14 @@ def create_comparison_data(
         "Rent_Monthly_Cashflow": rent_monthly_cashflow,
         "Securities_Monthly_Cashflow": securities_monthly_cashflow,
         "Combo_Monthly_Cashflow": combo_monthly_cashflow,
+        # Tax paid
+        "Income_Tax_Paid": income_tax_paid,
+        "House_Sell_Tax_Paid": house_sell_tax_paid,
+        "Rent_Tax_Paid": rent_tax_paid,
+        "Securities_Tax_Paid": securities_tax_paid,
+        "Combo_Tax_Paid": combo_tax_paid,
+        # Quarterly dividends
+        "Securities_Quarterly_Dividend": securities_quarterly_dividend_paid,
         # Inflation adjusted values
         "Inflation_Multiplier": inflation_adjusted_values,
         "Inflation_Adjusted_Income": inflation_adjusted_income,
@@ -711,6 +933,47 @@ app.layout = dbc.Container([
 
                     html.Label("Monthly Sell Amount ($)"),
                     dcc.Input(id="securities-monthly-sell", type="number", value=0, min=0, step=100, className="mb-2 form-control"),
+                    
+                    html.Label("Quarterly Dividend ($)"),
+                    dcc.Input(id="securities-quarterly-dividend", type="number", value=750, min=0, step=50, className="mb-2 form-control"),
+                    
+                    dbc.Checklist(
+                        id="securities-dividend-to-savings",
+                        options=[
+                            {"label": "Automatically deposit dividends to savings account", "value": "dividend-to-savings"},
+                        ],
+                        value=["dividend-to-savings"],
+                        inline=True,
+                        className="mb-2",
+                    ),
+                ]),
+            ], className="mb-4"),
+            
+            dbc.Card([
+                dbc.CardHeader("Income Tax Settings"),
+                dbc.CardBody([
+                    dbc.Checklist(
+                        id="apply-income-tax",
+                        options=[
+                            {"label": "Apply income tax to all income sources", "value": "apply-tax"},
+                        ],
+                        value=["apply-tax"],
+                        inline=True,
+                        className="mb-2",
+                    ),
+                    html.P("Tax brackets: Married Filing Jointly (2023)", className="text-muted mb-2"),
+                    html.Table([
+                        html.Thead(html.Tr([html.Th("Income Range"), html.Th("Tax Rate")])),
+                        html.Tbody([
+                            html.Tr([html.Td("$0 - $22,000"), html.Td("10%")]),
+                            html.Tr([html.Td("$22,001 - $89,450"), html.Td("12%")]),
+                            html.Tr([html.Td("$89,451 - $190,750"), html.Td("22%")]),
+                            html.Tr([html.Td("$190,751 - $364,200"), html.Td("24%")]),
+                            html.Tr([html.Td("$364,201 - $462,500"), html.Td("32%")]),
+                            html.Tr([html.Td("$462,501 - $693,750"), html.Td("35%")]),
+                            html.Tr([html.Td("$693,751+"), html.Td("37%")]),
+                        ]),
+                    ], className="table table-sm table-bordered"),
                 ]),
             ], className="mb-4"),
 
@@ -792,6 +1055,10 @@ app.layout = dbc.Container([
                 dbc.Tab([
                     dcc.Graph(id="inflation-impact-graph"),
                 ], label="Inflation Impact"),
+                
+                dbc.Tab([
+                    dcc.Graph(id="tax-impact-graph"),
+                ], label="Tax & Dividends"),
 
                 dbc.Tab([
                     html.Div(id="strategy-details", className="mt-3"),
@@ -835,6 +1102,11 @@ app.layout = dbc.Container([
                                 {"label": "Monthly Cash Flow (Rent Strategy)", "value": "Rent_Monthly_Cashflow"},
                                 {"label": "Monthly Cash Flow (Securities Strategy)", "value": "Securities_Monthly_Cashflow"},
                                 {"label": "Monthly Cash Flow (Rent + Sell Securities)", "value": "Combo_Monthly_Cashflow"},
+                                {"label": "Income Tax (Income Strategy)", "value": "Income_Tax_Paid"},
+                                {"label": "Income Tax (Rent Strategy)", "value": "Rent_Tax_Paid"},
+                                {"label": "Income Tax (Securities Strategy)", "value": "Securities_Tax_Paid"},
+                                {"label": "Income Tax (Combo Strategy)", "value": "Combo_Tax_Paid"},
+                                {"label": "Quarterly Dividends", "value": "Securities_Quarterly_Dividend"},
                             ],
                             value="Income_Net_Worth",
                             className="mb-3",
@@ -867,6 +1139,7 @@ app.layout = dbc.Container([
      Output("savings-comparison-graph", "figure"),
      Output("cashflow-comparison-graph", "figure"),
      Output("inflation-impact-graph", "figure"),
+     Output("tax-impact-graph", "figure"),
      Output("strategy-details", "children")],
     [Input("calculate-button", "n_clicks")],
     [State("principal", "value"),
@@ -884,6 +1157,9 @@ app.layout = dbc.Container([
      State("securities-growth-rate", "value"),
      State("securities-sell-month", "value"),
      State("securities-monthly-sell", "value"),
+     State("securities-quarterly-dividend", "value"),
+     State("securities-dividend-to-savings", "value"),
+     State("apply-income-tax", "value"),
      State("appreciation-rate", "value"),
      State("inflation-rate", "value"),
      State("inflation-apply-to", "value")],
@@ -893,6 +1169,7 @@ def update_results(n_clicks, principal, annual_rate, term_years,
                   existing_house_value, existing_house_appreciation_rate, existing_house_sell_month,
                   existing_house_rent, savings_initial, savings_interest_rate,
                   securities_value, securities_growth_rate, securities_sell_month, securities_monthly_sell,
+                  securities_quarterly_dividend, securities_dividend_to_savings, apply_income_tax,
                   appreciation_rate, inflation_rate, inflation_apply_to):
     # Convert percentage inputs to decimal
     annual_rate_decimal = annual_rate / 100 if annual_rate else 0
@@ -902,10 +1179,12 @@ def update_results(n_clicks, principal, annual_rate, term_years,
     securities_growth_rate_decimal = securities_growth_rate / 100 if securities_growth_rate else 0
     inflation_rate_decimal = inflation_rate / 100 if inflation_rate else 0
 
-    # Process inflation apply-to selections
+    # Process checkbox selections
     apply_inflation_to_income = "income" in inflation_apply_to if inflation_apply_to else False
     apply_inflation_to_expenses = "expenses" in inflation_apply_to if inflation_apply_to else False
     apply_inflation_to_rent = "rent" in inflation_apply_to if inflation_apply_to else False
+    apply_income_tax_bool = "apply-tax" in apply_income_tax if apply_income_tax else False
+    securities_dividend_to_savings_bool = "dividend-to-savings" in securities_dividend_to_savings if securities_dividend_to_savings else False
 
     # Calculate monthly payment
     monthly_payment = calculate_mortgage_payment(principal, annual_rate_decimal, term_years)
@@ -921,9 +1200,11 @@ def update_results(n_clicks, principal, annual_rate, term_years,
         existing_house_value, existing_house_sell_month, existing_house_rent, False,
         existing_house_appreciation_rate_decimal,
         securities_value, securities_growth_rate_decimal, securities_sell_month, securities_monthly_sell,
+        securities_quarterly_dividend, securities_dividend_to_savings_bool,
         savings_initial, savings_interest_rate_decimal,
         appreciation_rate_decimal,
         inflation_rate_decimal, apply_inflation_to_income, apply_inflation_to_expenses, apply_inflation_to_rent,
+        apply_income_tax_bool, TAX_BRACKETS_MFJ,
     )
 
     # Ensure values are not None for formatting
@@ -1008,7 +1289,16 @@ def update_results(n_clicks, principal, annual_rate, term_years,
                 html.P(f"Primary Monthly Income: ${monthly_income:.2f}"),
                 html.P(f"Rental Income: ${existing_house_rent:.2f}" if existing_house_rent > 0 else "No Rental Income"),
                 html.P(f"Securities Monthly Income: ${securities_monthly_income:.2f}" if securities_monthly_income > 0 else "No Securities Monthly Income"),
+                html.P(f"Quarterly Dividend: ${securities_quarterly_dividend:.2f}" if securities_quarterly_dividend > 0 else "No Quarterly Dividends"),
                 html.P(f"Total Monthly Income: ${affordability['total_monthly_income']:.2f}", className="font-weight-bold"),
+                
+                # Show tax information if enabled
+                html.P(f"Income Tax Applied: Yes" if apply_income_tax_bool else "Income Tax Applied: No", 
+                      className="mt-2"),
+                html.P(f"Estimated Monthly Income Tax: ${comparison_df['Income_Tax_Paid'].iloc[1]:.2f}" 
+                      if apply_income_tax_bool and comparison_df['Income_Tax_Paid'].iloc[1] > 0 
+                      else ""),
+                
                 html.P(f"Monthly Mortgage Payment: ${monthly_payment:.2f}"),
                 html.Hr(),
                 html.P(f"Front-end Ratio: {affordability['front_end_ratio']:.2f}% " + 
@@ -1523,6 +1813,63 @@ def update_results(n_clicks, principal, annual_rate, term_years,
         height=600,  # Consistent height
         margin=dict(t=80, b=50, l=50, r=50),  # Consistent margins
     )
+    
+    # Create tax and dividend impact graph
+    tax_fig = go.Figure()
+    
+    # Only show tax data if tax is applied
+    if apply_income_tax_bool:
+        tax_fig.add_trace(go.Scatter(
+            x=comparison_df["Month"],
+            y=comparison_df["Income_Tax_Paid"],
+            mode="lines",
+            name="Income Strategy Tax",
+            line=dict(color="red"),
+        ))
+        
+        tax_fig.add_trace(go.Scatter(
+            x=comparison_df["Month"],
+            y=comparison_df["Rent_Tax_Paid"],
+            mode="lines",
+            name="Rent Strategy Tax",
+            line=dict(color="orange"),
+        ))
+        
+        tax_fig.add_trace(go.Scatter(
+            x=comparison_df["Month"],
+            y=comparison_df["Securities_Tax_Paid"],
+            mode="lines",
+            name="Securities Strategy Tax",
+            line=dict(color="purple"),
+        ))
+        
+        tax_fig.add_trace(go.Scatter(
+            x=comparison_df["Month"],
+            y=comparison_df["Combo_Tax_Paid"],
+            mode="lines",
+            name="Combo Strategy Tax",
+            line=dict(color="green"),
+        ))
+    
+    # Add quarterly dividends on secondary y-axis
+    if securities_quarterly_dividend > 0:
+        tax_fig.add_trace(go.Bar(
+            x=comparison_df["Month"],
+            y=comparison_df["Securities_Quarterly_Dividend"],
+            name="Quarterly Dividends",
+            marker_color="rgba(0, 128, 255, 0.7)",
+        ))
+    
+    tax_fig.update_layout(
+        title="Income Tax and Quarterly Dividends",
+        xaxis_title="Month",
+        yaxis_title="Amount ($)",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="center", x=0.5),
+        template="plotly_white",
+        height=600,  # Consistent height
+        margin=dict(t=80, b=50, l=50, r=50),  # Consistent margins
+        barmode="overlay",
+    )
 
     # Create amortization graph
     amortization_fig = make_subplots(specs=[[{"secondary_y": True}]])
@@ -1678,7 +2025,7 @@ def update_results(n_clicks, principal, annual_rate, term_years,
         ]),
     ])
 
-    return payment_overview, cashflow_overview, affordability_overview, balance_fig, net_worth_fig, amortization_fig, securities_fig, savings_fig, cashflow_fig, inflation_fig, strategy_details
+    return payment_overview, cashflow_overview, affordability_overview, balance_fig, net_worth_fig, amortization_fig, securities_fig, savings_fig, cashflow_fig, inflation_fig, tax_fig, strategy_details
 
 # Scenario Management Callbacks
 @app.callback(
@@ -1700,6 +2047,9 @@ def update_results(n_clicks, principal, annual_rate, term_years,
      State("securities-growth-rate", "value"),
      State("securities-sell-month", "value"),
      State("securities-monthly-sell", "value"),
+     State("securities-quarterly-dividend", "value"),
+     State("securities-dividend-to-savings", "value"),
+     State("apply-income-tax", "value"),
      State("appreciation-rate", "value"),
      State("inflation-rate", "value"),
      State("inflation-apply-to", "value")],
@@ -1710,7 +2060,8 @@ def save_scenario(n_clicks, scenario_name, principal, annual_rate, term_years,
                  existing_house_appreciation_rate, existing_house_sell_month,
                  existing_house_rent, savings_initial, savings_interest_rate,
                  securities_value, securities_growth_rate, securities_sell_month,
-                 securities_monthly_sell, appreciation_rate, inflation_rate, inflation_apply_to):
+                 securities_monthly_sell, securities_quarterly_dividend, securities_dividend_to_savings,
+                 apply_income_tax, appreciation_rate, inflation_rate, inflation_apply_to):
     if not scenario_name:
         return html.P("Please enter a scenario name", className="text-danger")
 
@@ -1731,6 +2082,9 @@ def save_scenario(n_clicks, scenario_name, principal, annual_rate, term_years,
         "securities_growth_rate": securities_growth_rate,
         "securities_sell_month": securities_sell_month,
         "securities_monthly_sell": securities_monthly_sell,
+        "securities_quarterly_dividend": securities_quarterly_dividend,
+        "securities_dividend_to_savings": securities_dividend_to_savings,
+        "apply_income_tax": apply_income_tax,
         "appreciation_rate": appreciation_rate,
         "inflation_rate": inflation_rate,
         "inflation_apply_to": inflation_apply_to,
@@ -1791,6 +2145,9 @@ def delete_scenario(n_clicks, scenario_name):
      Output("securities-growth-rate", "value"),
      Output("securities-sell-month", "value"),
      Output("securities-monthly-sell", "value"),
+     Output("securities-quarterly-dividend", "value"),
+     Output("securities-dividend-to-savings", "value"),
+     Output("apply-income-tax", "value"),
      Output("appreciation-rate", "value"),
      Output("inflation-rate", "value"),
      Output("inflation-apply-to", "value"),
@@ -1801,10 +2158,19 @@ def delete_scenario(n_clicks, scenario_name):
 )
 def load_scenario(n_clicks, scenario_name):
     if not scenario_name:
-        return [dash.no_update] * 18 + [html.P("Please select a scenario to load", className="text-danger")]
+        return [dash.no_update] * 21 + [html.P("Please select a scenario to load", className="text-danger")]
 
     if scenario_name in stored_scenarios:
         scenario = stored_scenarios[scenario_name]
+        
+        # Handle missing fields for backward compatibility
+        if "securities_quarterly_dividend" not in scenario:
+            scenario["securities_quarterly_dividend"] = 0
+        if "securities_dividend_to_savings" not in scenario:
+            scenario["securities_dividend_to_savings"] = ["dividend-to-savings"]
+        if "apply_income_tax" not in scenario:
+            scenario["apply_income_tax"] = ["apply-tax"]
+        
         return [
             scenario["principal"],
             scenario["annual_rate"],
@@ -1821,12 +2187,15 @@ def load_scenario(n_clicks, scenario_name):
             scenario["securities_growth_rate"],
             scenario["securities_sell_month"],
             scenario["securities_monthly_sell"],
+            scenario["securities_quarterly_dividend"],
+            scenario["securities_dividend_to_savings"],
+            scenario["apply_income_tax"],
             scenario["appreciation_rate"],
             scenario["inflation_rate"],
             scenario["inflation_apply_to"],
             html.P(f"Scenario '{scenario_name}' loaded successfully!", className="text-success"),
         ]
-    return [dash.no_update] * 18 + [html.P(f"Scenario '{scenario_name}' not found", className="text-danger")]
+    return [dash.no_update] * 21 + [html.P(f"Scenario '{scenario_name}' not found", className="text-danger")]
 
 @app.callback(
     [Output("scenario-comparison-graph", "figure"),
@@ -1854,6 +2223,12 @@ def update_scenario_comparison(scenario1, scenario2, metric):
     s1_apply_inflation_to_income = "income" in s1["inflation_apply_to"] if s1["inflation_apply_to"] else False
     s1_apply_inflation_to_expenses = "expenses" in s1["inflation_apply_to"] if s1["inflation_apply_to"] else False
     s1_apply_inflation_to_rent = "rent" in s1["inflation_apply_to"] if s1["inflation_apply_to"] else False
+    
+    # Check for new fields and provide defaults if they don't exist (backward compatibility)
+    s1_securities_quarterly_dividend = s1.get("securities_quarterly_dividend", 0)
+    s1_securities_dividend_to_savings = "dividend-to-savings" in s1.get("securities_dividend_to_savings", [])
+    s1_apply_income_tax = "apply-tax" in s1.get("apply_income_tax", [])
+    
     # All proceeds go to savings (house_sale_to_securities is always False)
     s1_house_sale_to_securities = False
 
@@ -1863,9 +2238,11 @@ def update_scenario_comparison(scenario1, scenario2, metric):
         s1["existing_house_value"], s1["existing_house_sell_month"], s1["existing_house_rent"], s1_house_sale_to_securities,
         s1_existing_house_appreciation_rate,
         s1["securities_value"], s1_securities_growth_rate, s1["securities_sell_month"], s1["securities_monthly_sell"],
+        s1_securities_quarterly_dividend, s1_securities_dividend_to_savings,
         s1["savings_initial"], s1_savings_interest_rate,
         s1_appreciation_rate,
         s1_inflation_rate, s1_apply_inflation_to_income, s1_apply_inflation_to_expenses, s1_apply_inflation_to_rent,
+        s1_apply_income_tax, TAX_BRACKETS_MFJ,
     )
 
     # Generate data for second scenario
@@ -1879,6 +2256,12 @@ def update_scenario_comparison(scenario1, scenario2, metric):
     s2_apply_inflation_to_income = "income" in s2["inflation_apply_to"] if s2["inflation_apply_to"] else False
     s2_apply_inflation_to_expenses = "expenses" in s2["inflation_apply_to"] if s2["inflation_apply_to"] else False
     s2_apply_inflation_to_rent = "rent" in s2["inflation_apply_to"] if s2["inflation_apply_to"] else False
+    
+    # Check for new fields and provide defaults if they don't exist (backward compatibility)
+    s2_securities_quarterly_dividend = s2.get("securities_quarterly_dividend", 0)
+    s2_securities_dividend_to_savings = "dividend-to-savings" in s2.get("securities_dividend_to_savings", [])
+    s2_apply_income_tax = "apply-tax" in s2.get("apply_income_tax", [])
+    
     # All proceeds go to savings (house_sale_to_securities is always False)
     s2_house_sale_to_securities = False
 
@@ -1888,9 +2271,11 @@ def update_scenario_comparison(scenario1, scenario2, metric):
         s2["existing_house_value"], s2["existing_house_sell_month"], s2["existing_house_rent"], s2_house_sale_to_securities,
         s2_existing_house_appreciation_rate,
         s2["securities_value"], s2_securities_growth_rate, s2["securities_sell_month"], s2["securities_monthly_sell"],
+        s2_securities_quarterly_dividend, s2_securities_dividend_to_savings,
         s2["savings_initial"], s2_savings_interest_rate,
         s2_appreciation_rate,
         s2_inflation_rate, s2_apply_inflation_to_income, s2_apply_inflation_to_expenses, s2_apply_inflation_to_rent,
+        s2_apply_income_tax, TAX_BRACKETS_MFJ,
     )
 
     # Create comparison figure
@@ -1934,6 +2319,11 @@ def update_scenario_comparison(scenario1, scenario2, metric):
         {"label": "Monthly Cash Flow (Rent Strategy)", "value": "Rent_Monthly_Cashflow"},
         {"label": "Monthly Cash Flow (Securities Strategy)", "value": "Securities_Monthly_Cashflow"},
         {"label": "Monthly Cash Flow (Rent + Sell Securities)", "value": "Combo_Monthly_Cashflow"},
+        {"label": "Income Tax (Income Strategy)", "value": "Income_Tax_Paid"},
+        {"label": "Income Tax (Rent Strategy)", "value": "Rent_Tax_Paid"},
+        {"label": "Income Tax (Securities Strategy)", "value": "Securities_Tax_Paid"},
+        {"label": "Income Tax (Combo Strategy)", "value": "Combo_Tax_Paid"},
+        {"label": "Quarterly Dividends", "value": "Securities_Quarterly_Dividend"},
     ] if opt["value"] == metric), "Selected Metric")
 
     fig.update_layout(
@@ -1967,6 +2357,8 @@ def update_scenario_comparison(scenario1, scenario2, metric):
                 html.Tr([html.Td("Term Years"), html.Td(s1["term_years"]), html.Td(s2["term_years"])]),
                 html.Tr([html.Td("Monthly Income"), html.Td(f"${s1['monthly_income']:,.2f}"), html.Td(f"${s2['monthly_income']:,.2f}")]),
                 html.Tr([html.Td("Monthly Expenses"), html.Td(f"${s1['monthly_expenses']:,.2f}"), html.Td(f"${s2['monthly_expenses']:,.2f}")]),
+                html.Tr([html.Td("Quarterly Dividend"), html.Td(f"${s1_securities_quarterly_dividend:,.2f}"), html.Td(f"${s2_securities_quarterly_dividend:,.2f}")]),
+                html.Tr([html.Td("Income Tax Applied"), html.Td("Yes" if s1_apply_income_tax else "No"), html.Td("Yes" if s2_apply_income_tax else "No")]),
                 html.Tr([html.Td("Inflation Rate"), html.Td(f"{s1['inflation_rate']}%"), html.Td(f"{s2['inflation_rate']}%")]),
                 html.Tr([html.Td("Securities Growth Rate"), html.Td(f"{s1['securities_growth_rate']}%"), html.Td(f"{s2['securities_growth_rate']}%")]),
             ]),
