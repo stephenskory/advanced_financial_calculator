@@ -1,5 +1,6 @@
 import dash
 import dash_bootstrap_components as dbc
+import json
 import pandas as pd
 import plotly.graph_objects as go
 from dash import Input, Output, State, dcc, html
@@ -71,6 +72,239 @@ def calculate_house_capital_gains_tax(sale_price, purchase_price, brackets=TAX_B
     net_proceeds = sale_price - capital_gains_tax
     
     return capital_gains_tax, net_proceeds
+
+
+# Helper function to safely get tax paid for a strategy
+def get_tax_paid_for_strategy(comparison_df, strategy):
+    """Get the total tax paid for a given strategy, handling missing columns gracefully."""
+    try:
+        strategy_prefix = strategy.split("_")[0]
+        tax_column = f"{strategy_prefix}_Tax_Paid"
+        if tax_column in comparison_df.columns:
+            return comparison_df[tax_column].sum()
+        else:
+            return 0
+    except Exception as e:
+        print(f"Warning: Tax calculation error for {strategy} - {str(e)}")
+        return 0
+
+# Function to find the optimal strategy for maximizing net worth
+def find_optimal_strategy(
+    principal, annual_rate, term_years,
+    monthly_income, monthly_expenses,
+    existing_house_value, existing_house_purchase_price, 
+    existing_house_appreciation_rate, existing_house_rent_income,
+    securities_value, securities_growth_rate, securities_quarterly_dividend,
+    savings_initial, savings_interest_rate,
+    home_appreciation_rate, inflation_rate, apply_income_tax=True,
+    apply_inflation_to_income=True, apply_inflation_to_expenses=True, apply_inflation_to_rent=True,
+    max_search_months=120,  # Limit search space to first 10 years
+    test_mode=False  # Set to True for testing to limit combinations
+):
+    """
+    Find the optimal strategy for maximizing net worth by varying:
+    - Whether to sell the existing house and in which month
+    - Whether to apply house sale proceeds to mortgage or savings
+    - Whether to sell securities all at once or monthly
+    
+    Args:
+        All the usual parameters for the mortgage calculator
+        max_search_months: Maximum months to search (to limit computation)
+        
+    Returns:
+        Dictionary with the optimal strategy parameters and results
+    """
+    # Initialize variables to track the best strategy
+    max_net_worth = 0
+    optimal_strategy = {
+        "house_sell_month": -1,  # Default: don't sell
+        "house_sale_to_mortgage": False,  # Default: proceeds go to savings
+        "securities_sell_month": 0,  # Default: don't sell all at once
+        "securities_monthly_sell": 0,  # Default: don't sell monthly
+        "final_net_worth": 0,
+        "strategy_name": "",
+        "tax_paid": 0,
+    }
+    
+    # Convert rates to decimals
+    annual_rate_decimal = annual_rate / 100 if annual_rate is not None else 0
+    existing_house_appreciation_rate_decimal = existing_house_appreciation_rate / 100 if existing_house_appreciation_rate is not None else 0
+    securities_growth_rate_decimal = securities_growth_rate / 100 if securities_growth_rate is not None else 0
+    savings_interest_rate_decimal = savings_interest_rate / 100 if savings_interest_rate is not None else 0
+    home_appreciation_rate_decimal = home_appreciation_rate / 100 if home_appreciation_rate is not None else 0
+    inflation_rate_decimal = inflation_rate / 100 if inflation_rate is not None else 0
+    
+    # Get actual term in months
+    max_months = min(int(term_years * 12), max_search_months)
+    
+    # Test cases for house sale month
+    # -1: don't sell, 0-max_months: sell in that month
+    if test_mode:
+        # Simplified options for testing to reduce computation time
+        house_sell_options = [-1, 1, 6]  # Don't sell, month 1, month 6
+    else:
+        house_sell_options = [-1] + list(range(0, max_months, 12))  # Test yearly intervals
+    
+    # Test cases for where house sale proceeds go
+    house_sale_to_mortgage_options = [False, True]  # False: to savings, True: to mortgage
+    
+    # Test cases for securities
+    # One-time sell options: 0 (don't sell) or specific months
+    if test_mode:
+        # Simplified options for testing to reduce computation time
+        securities_sell_month_options = [0, 1]  # Don't sell, month 1
+    else:
+        securities_sell_month_options = [0] + list(range(0, max_months, 12))  # Test yearly intervals
+    
+    # Monthly sell options: different amounts to sell monthly
+    securities_monthly_sell_options = [0]  # Start with not selling monthly
+    if securities_value > 0:
+        if test_mode:
+            # Simplified options for testing
+            monthly_sell = securities_value * 0.01
+            securities_monthly_sell_options.append(monthly_sell)
+        else:
+            # Add options for selling 1%, 2%, or 5% of initial securities value each month
+            for pct in [0.01, 0.02, 0.05]:
+                monthly_sell = securities_value * pct
+                securities_monthly_sell_options.append(monthly_sell)
+    
+    # Calculate total number of combinations to test
+    total_combinations = len(house_sell_options) * len(house_sale_to_mortgage_options) * (
+        len(securities_sell_month_options) + len(securities_monthly_sell_options) - 1)
+    
+    # Print the search space size
+    print(f"Searching {total_combinations} combinations...")
+    
+    # Test each combination
+    for house_sell_month in house_sell_options:
+        # Skip house sale destination option if not selling house
+        if house_sell_month < 0:
+            house_sale_to_mortgage_options_current = [False]  # Only one option needed if not selling
+        else:
+            house_sale_to_mortgage_options_current = house_sale_to_mortgage_options
+        
+        for house_sale_to_mortgage in house_sale_to_mortgage_options_current:
+            # Test one-time securities sell options (with no monthly selling)
+            for securities_sell_month in securities_sell_month_options:
+                if securities_sell_month > 0 and house_sell_month > 0 and house_sell_month == securities_sell_month:
+                    # Skip cases where we sell both house and securities in the same month
+                    # This is just to reduce combinations and avoid liquidity spikes
+                    continue
+                    
+                # Create comparison data for this combination
+                comparison_df = create_comparison_data(
+                    principal=principal, 
+                    annual_rate=annual_rate_decimal, 
+                    term_years=term_years,
+                    monthly_income=monthly_income, 
+                    monthly_expenses=monthly_expenses,
+                    existing_house_value=existing_house_value, 
+                    existing_house_sell_month=house_sell_month,
+                    existing_house_rent_income=existing_house_rent_income, 
+                    existing_house_sale_to_mortgage=house_sale_to_mortgage,
+                    existing_house_purchase_price=existing_house_purchase_price,
+                    existing_house_appreciation_rate=existing_house_appreciation_rate_decimal,
+                    securities_value=securities_value, 
+                    securities_growth_rate=securities_growth_rate_decimal, 
+                    securities_sell_month=securities_sell_month,
+                    securities_monthly_sell=0,  # Not selling monthly in this test
+                    securities_quarterly_dividend=securities_quarterly_dividend,
+                    securities_dividend_to_savings=True,  # Always reinvest dividends
+                    savings_initial=savings_initial, 
+                    savings_interest_rate=savings_interest_rate_decimal,
+                    home_appreciation_rate=home_appreciation_rate_decimal,
+                    inflation_rate=inflation_rate_decimal, 
+                    apply_inflation_to_income=apply_inflation_to_income,
+                    apply_inflation_to_expenses=apply_inflation_to_expenses, 
+                    apply_inflation_to_rent=apply_inflation_to_rent,
+                    apply_income_tax=apply_income_tax,
+                )
+                
+                # Get the final net worth (try all strategies and take the best)
+                strategies = ["Income_Net_Worth", "House_Sell_Net_Worth", "Rent_Net_Worth", 
+                             "Securities_Net_Worth", "Combo_Net_Worth"]
+                
+                for strategy in strategies:
+                    # Get the final net worth for this strategy
+                    final_net_worth = comparison_df[strategy].iloc[-1]
+                    
+                    # Get the total tax paid for this strategy using the helper function
+                    total_tax_paid = get_tax_paid_for_strategy(comparison_df, strategy)
+                    
+                    # If this is better than our current best, update the optimal strategy
+                    if final_net_worth > max_net_worth:
+                        max_net_worth = final_net_worth
+                        optimal_strategy = {
+                            "house_sell_month": house_sell_month,
+                            "house_sale_to_mortgage": house_sale_to_mortgage,
+                            "securities_sell_month": securities_sell_month,
+                            "securities_monthly_sell": 0,
+                            "final_net_worth": final_net_worth,
+                            "strategy_name": strategy.split("_")[0],  # Just the prefix (Income, House_Sell, etc.)
+                            "tax_paid": total_tax_paid,
+                        }
+            
+            # Test monthly securities selling options (with no one-time selling)
+            for securities_monthly_sell in securities_monthly_sell_options:
+                if securities_monthly_sell == 0:
+                    continue  # Skip the no-selling case (already tested above)
+                    
+                # Create comparison data for this combination
+                comparison_df = create_comparison_data(
+                    principal=principal, 
+                    annual_rate=annual_rate_decimal, 
+                    term_years=term_years,
+                    monthly_income=monthly_income, 
+                    monthly_expenses=monthly_expenses,
+                    existing_house_value=existing_house_value, 
+                    existing_house_sell_month=house_sell_month,
+                    existing_house_rent_income=existing_house_rent_income, 
+                    existing_house_sale_to_mortgage=house_sale_to_mortgage,
+                    existing_house_purchase_price=existing_house_purchase_price,
+                    existing_house_appreciation_rate=existing_house_appreciation_rate_decimal,
+                    securities_value=securities_value, 
+                    securities_growth_rate=securities_growth_rate_decimal, 
+                    securities_sell_month=0,  # Not selling all at once in this test
+                    securities_monthly_sell=securities_monthly_sell,
+                    securities_quarterly_dividend=securities_quarterly_dividend,
+                    securities_dividend_to_savings=True,  # Always reinvest dividends
+                    savings_initial=savings_initial, 
+                    savings_interest_rate=savings_interest_rate_decimal,
+                    home_appreciation_rate=home_appreciation_rate_decimal,
+                    inflation_rate=inflation_rate_decimal, 
+                    apply_inflation_to_income=apply_inflation_to_income,
+                    apply_inflation_to_expenses=apply_inflation_to_expenses, 
+                    apply_inflation_to_rent=apply_inflation_to_rent,
+                    apply_income_tax=apply_income_tax,
+                )
+                
+                # Get the final net worth (try all strategies and take the best)
+                strategies = ["Income_Net_Worth", "House_Sell_Net_Worth", "Rent_Net_Worth", 
+                             "Securities_Net_Worth", "Combo_Net_Worth"]
+                
+                for strategy in strategies:
+                    # Get the final net worth for this strategy
+                    final_net_worth = comparison_df[strategy].iloc[-1]
+                    
+                    # Get the total tax paid for this strategy using the helper function
+                    total_tax_paid = get_tax_paid_for_strategy(comparison_df, strategy)
+                    
+                    # If this is better than our current best, update the optimal strategy
+                    if final_net_worth > max_net_worth:
+                        max_net_worth = final_net_worth
+                        optimal_strategy = {
+                            "house_sell_month": house_sell_month,
+                            "house_sale_to_mortgage": house_sale_to_mortgage,
+                            "securities_sell_month": 0,
+                            "securities_monthly_sell": securities_monthly_sell,
+                            "final_net_worth": final_net_worth,
+                            "strategy_name": strategy.split("_")[0],  # Just the prefix (Income, House_Sell, etc.)
+                            "tax_paid": total_tax_paid,
+                        }
+    
+    # Return the optimal strategy
+    return optimal_strategy
 
 # Mortgage calculator functions
 def calculate_mortgage_payment(principal, annual_rate, term_years):
@@ -214,7 +448,7 @@ def create_comparison_data(
     principal, annual_rate, term_years,
     monthly_income, monthly_expenses,
     existing_house_value=0, existing_house_sell_month=-1,
-    existing_house_rent_income=0, existing_house_sale_to_securities=False,
+    existing_house_rent_income=0, existing_house_sale_to_mortgage=False,
     existing_house_purchase_price=0,  # Purchase price of existing house (for capital gains calculation)
     existing_house_appreciation_rate=0.03,  # Default 3% annual appreciation for existing house
     securities_value=0, securities_growth_rate=0, securities_sell_month=0,
@@ -542,14 +776,26 @@ def create_comparison_data(
                 capital_gains_tax, net_proceeds = calculate_house_capital_gains_tax(
                     current_existing_house_value, existing_house_purchase_price
                 )
-                # Add the house sale proceeds net of tax to savings
-                house_sell_savings_value[month] += net_proceeds
                 
                 # Record the capital gains tax in the monthly tax amount
                 house_sell_tax_paid[month] += capital_gains_tax
             else:
-                # No tax, add the full proceeds to savings
-                house_sell_savings_value[month] += current_existing_house_value
+                # No tax, full proceeds available
+                net_proceeds = current_existing_house_value
+            
+            # Apply proceeds based on user preference
+            if existing_house_sale_to_mortgage:
+                # Apply proceeds directly to mortgage principal
+                # This reduces the loan balance directly
+                house_sell_remaining_balance[month] = max(0, house_sell_remaining_balance[month] - net_proceeds)
+                
+                # If proceeds exceed the remaining balance, put the excess in savings
+                if net_proceeds > prev_balance:
+                    excess_proceeds = net_proceeds - prev_balance
+                    house_sell_savings_value[month] += excess_proceeds
+            else:
+                # Add the full proceeds to savings (original behavior)
+                house_sell_savings_value[month] += net_proceeds
 
         # Add monthly leftovers to savings
         if monthly_leftover > 0:
@@ -793,14 +1039,26 @@ def create_comparison_data(
                 capital_gains_tax, net_proceeds = calculate_house_capital_gains_tax(
                     current_existing_house_value, existing_house_purchase_price
                 )
-                # Add the house sale proceeds net of tax to savings
-                combo_savings_value[month] += net_proceeds
                 
                 # Record the capital gains tax in the monthly tax amount
                 combo_tax_paid[month] += capital_gains_tax
             else:
-                # No tax, add the full proceeds to savings
-                combo_savings_value[month] += current_existing_house_value
+                # No tax, full proceeds available
+                net_proceeds = current_existing_house_value
+            
+            # Apply proceeds based on user preference
+            if existing_house_sale_to_mortgage:
+                # Apply proceeds directly to mortgage principal
+                # This reduces the loan balance directly
+                combo_remaining_balance[month] = max(0, combo_remaining_balance[month] - net_proceeds)
+                
+                # If proceeds exceed the remaining balance, put the excess in savings
+                if net_proceeds > prev_balance:
+                    excess_proceeds = net_proceeds - prev_balance
+                    combo_savings_value[month] += excess_proceeds
+            else:
+                # Add the full proceeds to savings (original behavior)
+                combo_savings_value[month] += net_proceeds
                 
             # House is no longer owned after this month    
             house_is_owned = False
@@ -1002,7 +1260,18 @@ app.layout = dbc.Container([
                     html.Label("Sell in Month # (negative = don't sell)"),
                     dcc.Input(id="existing-house-sell-month", type="number", value=-1, min=-1, step=1, className="mb-2 form-control"),
 
-                    html.P("Sale proceeds (minus capital gains tax if applicable) are added to savings account", className="text-muted mb-2"),
+                    html.Label("Apply House Sale Proceeds To:"),
+                    dbc.RadioItems(
+                        id="existing-house-sale-destination",
+                        options=[
+                            {"label": "Savings Account", "value": "savings"},
+                            {"label": "Mortgage Principal", "value": "mortgage"},
+                        ],
+                        value="savings",
+                        inline=True,
+                        className="mb-2",
+                    ),
+                    html.P("If mortgage is selected, proceeds (after tax) reduce principal directly", className="text-muted mb-2"),
 
                     html.Label("Monthly Rental Income ($)"),
                     dcc.Input(id="existing-house-rent", type="number", value=1500, min=0, step=100, className="mb-2 form-control"),
@@ -1099,6 +1368,20 @@ app.layout = dbc.Container([
                     ),
                     dbc.Button("Delete Scenario", id="delete-scenario-button", color="danger", className="w-100 mb-2"),
                     html.Div(id="scenario-message", className="mt-2"),
+                ]),
+            ], className="mb-4"),
+            
+            dbc.Card([
+                dbc.CardHeader("Strategy Optimization"),
+                dbc.CardBody([
+                    html.P("Find the optimal strategy that maximizes net worth by testing different:"),
+                    html.Ul([
+                        html.Li("House selling timings"),
+                        html.Li("Securities selling approaches"),
+                    ]),
+                    html.P("The optimizer will consider all tax implications, including the $500,000 capital gains exemption."),
+                    dbc.Button("Find Optimal Strategy", id="optimize-strategy-button", color="success", className="w-100 mb-2"),
+                    html.Div(id="optimization-results", className="mt-3"),
                 ]),
             ], className="mb-4"),
 
@@ -1252,6 +1535,7 @@ app.layout = dbc.Container([
      State("existing-house-purchase-price", "value"),
      State("existing-house-appreciation-rate", "value"),
      State("existing-house-sell-month", "value"),
+     State("existing-house-sale-destination", "value"),
      State("existing-house-rent", "value"),
      State("savings-initial", "value"),
      State("savings-interest-rate", "value"),
@@ -1269,7 +1553,8 @@ app.layout = dbc.Container([
 def update_results(n_clicks, principal, annual_rate, term_years,
                   monthly_income, monthly_expenses,
                   existing_house_value, existing_house_purchase_price, existing_house_appreciation_rate, 
-                  existing_house_sell_month, existing_house_rent, savings_initial, savings_interest_rate,
+                  existing_house_sell_month, existing_house_sale_destination, existing_house_rent, 
+                  savings_initial, savings_interest_rate,
                   securities_value, securities_growth_rate, securities_sell_month, securities_monthly_sell,
                   securities_quarterly_dividend, securities_dividend_to_savings, apply_income_tax,
                   appreciation_rate, inflation_rate, inflation_apply_to):
@@ -1295,11 +1580,13 @@ def update_results(n_clicks, principal, annual_rate, term_years,
     amortization_df = generate_amortization_schedule(principal, annual_rate_decimal, term_years)
 
     # Generate comparison data 
-    # Note: house_sale_to_securities is now always False since all proceeds go to savings
+    # Convert existing_house_sale_destination from string to boolean for use in function
+    existing_house_sale_to_mortgage = existing_house_sale_destination == "mortgage"
+    
     comparison_df = create_comparison_data(
         principal, annual_rate_decimal, term_years,
         monthly_income, monthly_expenses,
-        existing_house_value, existing_house_sell_month, existing_house_rent, False,
+        existing_house_value, existing_house_sell_month, existing_house_rent, existing_house_sale_to_mortgage,
         existing_house_purchase_price,  # Purchase price for capital gains calculation
         existing_house_appreciation_rate_decimal,
         securities_value, securities_growth_rate_decimal, securities_sell_month, securities_monthly_sell,
@@ -2040,7 +2327,8 @@ def update_results(n_clicks, principal, annual_rate, term_years,
                             html.P(f"Net Proceeds After Tax: ${comparison_df['Existing_House_Value'].iloc[-1] - max(0, comparison_df['Existing_House_Value'].iloc[-1] - existing_house_purchase_price - 500000) * 0.15:.2f}"),
                         ]) if existing_house_sell_month is not None and existing_house_sell_month >= 0 and apply_income_tax_bool else html.P("Capital Gains Tax: Not Applied"),
                         
-                        html.P("Proceeds Go To: Savings Account"),
+                        html.P(f"Proceeds Go To: {existing_house_sale_destination.capitalize()}"),
+                        html.P("When applied to mortgage, proceeds directly reduce the loan balance" if existing_house_sale_destination == "mortgage" else "", className="text-muted"),
                         html.P(f"Net Worth After {safe_term_years} Years: ${comparison_df['House_Sell_Net_Worth'].iloc[-1]:.2f}"),
                     ]),
                 ], className="mb-3"),
@@ -2156,6 +2444,7 @@ def update_results(n_clicks, principal, annual_rate, term_years,
      State("existing-house-purchase-price", "value"),
      State("existing-house-appreciation-rate", "value"),
      State("existing-house-sell-month", "value"),
+     State("existing-house-sale-destination", "value"),
      State("existing-house-rent", "value"),
      State("savings-initial", "value"),
      State("savings-interest-rate", "value"),
@@ -2173,7 +2462,7 @@ def update_results(n_clicks, principal, annual_rate, term_years,
 )
 def save_scenario(n_clicks, scenario_name, principal, annual_rate, term_years,
                  monthly_income, monthly_expenses, existing_house_value, existing_house_purchase_price,
-                 existing_house_appreciation_rate, existing_house_sell_month,
+                 existing_house_appreciation_rate, existing_house_sell_month, existing_house_sale_destination,
                  existing_house_rent, savings_initial, savings_interest_rate,
                  securities_value, securities_growth_rate, securities_sell_month,
                  securities_monthly_sell, securities_quarterly_dividend, securities_dividend_to_savings,
@@ -2192,6 +2481,7 @@ def save_scenario(n_clicks, scenario_name, principal, annual_rate, term_years,
         "existing_house_purchase_price": existing_house_purchase_price,
         "existing_house_appreciation_rate": existing_house_appreciation_rate,
         "existing_house_sell_month": existing_house_sell_month,
+        "existing_house_sale_destination": existing_house_sale_destination,
         "existing_house_rent": existing_house_rent,
         "savings_initial": savings_initial,
         "savings_interest_rate": savings_interest_rate,
@@ -2256,6 +2546,7 @@ def delete_scenario(n_clicks, scenario_name):
      Output("existing-house-purchase-price", "value"),
      Output("existing-house-appreciation-rate", "value"),
      Output("existing-house-sell-month", "value"),
+     Output("existing-house-sale-destination", "value"),
      Output("existing-house-rent", "value"),
      Output("savings-initial", "value"),
      Output("savings-interest-rate", "value"),
@@ -2276,7 +2567,7 @@ def delete_scenario(n_clicks, scenario_name):
 )
 def load_scenario(n_clicks, scenario_name):
     if not scenario_name:
-        return [dash.no_update] * 22 + [html.P("Please select a scenario to load", className="text-danger")]
+        return [dash.no_update] * 23 + [html.P("Please select a scenario to load", className="text-danger")]
 
     if scenario_name in stored_scenarios:
         scenario = stored_scenarios[scenario_name]
@@ -2291,6 +2582,10 @@ def load_scenario(n_clicks, scenario_name):
         if "existing_house_purchase_price" not in scenario:
             scenario["existing_house_purchase_price"] = 0
         
+        # Check for house sale destination in the scenario, provide default for backwards compatibility
+        if "existing_house_sale_destination" not in scenario:
+            scenario["existing_house_sale_destination"] = "savings"
+            
         return [
             scenario["principal"],
             scenario["annual_rate"],
@@ -2301,6 +2596,7 @@ def load_scenario(n_clicks, scenario_name):
             scenario["existing_house_purchase_price"],
             scenario["existing_house_appreciation_rate"],
             scenario["existing_house_sell_month"],
+            scenario["existing_house_sale_destination"],
             scenario["existing_house_rent"],
             scenario["savings_initial"],
             scenario["savings_interest_rate"],
@@ -2316,7 +2612,7 @@ def load_scenario(n_clicks, scenario_name):
             scenario["inflation_apply_to"],
             html.P(f"Scenario '{scenario_name}' loaded successfully!", className="text-success"),
         ]
-    return [dash.no_update] * 22 + [html.P(f"Scenario '{scenario_name}' not found", className="text-danger")]
+    return [dash.no_update] * 23 + [html.P(f"Scenario '{scenario_name}' not found", className="text-danger")]
 
 @app.callback(
     [Output("scenario-comparison-graph", "figure"),
@@ -2351,13 +2647,13 @@ def update_scenario_comparison(scenario1, scenario2, metric):
     s1_apply_income_tax = "apply-tax" in s1.get("apply_income_tax", [])
     s1_existing_house_purchase_price = s1.get("existing_house_purchase_price", 0)
     
-    # All proceeds go to savings (house_sale_to_securities is always False)
-    s1_house_sale_to_securities = False
+    # Check for house sale destination in the scenario, provide default for backwards compatibility
+    s1_existing_house_sale_to_mortgage = s1.get("existing_house_sale_destination", "savings") == "mortgage"
 
     s1_data = create_comparison_data(
         s1["principal"], s1_annual_rate, s1["term_years"],
         s1["monthly_income"], s1["monthly_expenses"],
-        s1["existing_house_value"], s1["existing_house_sell_month"], s1["existing_house_rent"], s1_house_sale_to_securities,
+        s1["existing_house_value"], s1["existing_house_sell_month"], s1["existing_house_rent"], s1_existing_house_sale_to_mortgage,
         s1_existing_house_purchase_price,  # Purchase price for capital gains
         s1_existing_house_appreciation_rate,
         s1["securities_value"], s1_securities_growth_rate, s1["securities_sell_month"], s1["securities_monthly_sell"],
@@ -2386,13 +2682,13 @@ def update_scenario_comparison(scenario1, scenario2, metric):
     s2_apply_income_tax = "apply-tax" in s2.get("apply_income_tax", [])
     s2_existing_house_purchase_price = s2.get("existing_house_purchase_price", 0)
     
-    # All proceeds go to savings (house_sale_to_securities is always False)
-    s2_house_sale_to_securities = False
+    # Check for house sale destination in the scenario, provide default for backwards compatibility
+    s2_existing_house_sale_to_mortgage = s2.get("existing_house_sale_destination", "savings") == "mortgage"
 
     s2_data = create_comparison_data(
         s2["principal"], s2_annual_rate, s2["term_years"],
         s2["monthly_income"], s2["monthly_expenses"],
-        s2["existing_house_value"], s2["existing_house_sell_month"], s2["existing_house_rent"], s2_house_sale_to_securities,
+        s2["existing_house_value"], s2["existing_house_sell_month"], s2["existing_house_rent"], s2_existing_house_sale_to_mortgage,
         s2_existing_house_purchase_price,  # Purchase price for capital gains
         s2_existing_house_appreciation_rate,
         s2["securities_value"], s2_securities_growth_rate, s2["securities_sell_month"], s2["securities_monthly_sell"],
@@ -2494,6 +2790,175 @@ def update_scenario_comparison(scenario1, scenario2, metric):
     ])
 
     return fig, summary
+
+# Callback for the optimization button
+@app.callback(
+    Output("optimization-results", "children"),
+    Input("optimize-strategy-button", "n_clicks"),
+    [State("principal", "value"),
+     State("annual-rate", "value"),
+     State("term-years", "value"),
+     State("monthly-income", "value"),
+     State("monthly-expenses", "value"),
+     State("existing-house-value", "value"),
+     State("existing-house-purchase-price", "value"),
+     State("existing-house-appreciation-rate", "value"),
+     State("existing-house-sell-month", "value"),
+     State("existing-house-sale-destination", "value"),
+     State("existing-house-rent", "value"),
+     State("savings-initial", "value"),
+     State("savings-interest-rate", "value"),
+     State("securities-value", "value"),
+     State("securities-growth-rate", "value"),
+     State("securities-sell-month", "value"),
+     State("securities-monthly-sell", "value"),
+     State("securities-quarterly-dividend", "value"),
+     State("apply-income-tax", "value"),
+     State("appreciation-rate", "value"),
+     State("inflation-rate", "value"),
+     State("inflation-apply-to", "value")],
+    prevent_initial_call=True,
+)
+def run_optimization(n_clicks, principal, annual_rate, term_years,
+                   monthly_income, monthly_expenses,
+                   existing_house_value, existing_house_purchase_price, 
+                   existing_house_appreciation_rate, existing_house_sell_month,
+                   existing_house_sale_destination, existing_house_rent, 
+                   savings_initial, savings_interest_rate,
+                   securities_value, securities_growth_rate, securities_sell_month, 
+                   securities_monthly_sell, securities_quarterly_dividend,
+                   apply_income_tax, appreciation_rate, inflation_rate, inflation_apply_to):
+    """Run the optimization to find the best strategy."""
+    if n_clicks is None:
+        return html.P("Click the button to find the optimal strategy.")
+        
+    # Process checkbox selections
+    apply_inflation_to_income = "income" in inflation_apply_to if inflation_apply_to else False
+    apply_inflation_to_expenses = "expenses" in inflation_apply_to if inflation_apply_to else False
+    apply_inflation_to_rent = "rent" in inflation_apply_to if inflation_apply_to else False
+    apply_income_tax_bool = "apply-tax" in apply_income_tax if apply_income_tax else False
+    
+    # Run the optimization
+    try:
+        optimal_strategy = find_optimal_strategy(
+            principal=principal, 
+            annual_rate=annual_rate, 
+            term_years=term_years,
+            monthly_income=monthly_income, 
+            monthly_expenses=monthly_expenses,
+            existing_house_value=existing_house_value, 
+            existing_house_purchase_price=existing_house_purchase_price,
+            existing_house_appreciation_rate=existing_house_appreciation_rate, 
+            existing_house_rent_income=existing_house_rent,
+            securities_value=securities_value, 
+            securities_growth_rate=securities_growth_rate, 
+            securities_quarterly_dividend=securities_quarterly_dividend,
+            savings_initial=savings_initial, 
+            savings_interest_rate=savings_interest_rate,
+            home_appreciation_rate=appreciation_rate,
+            inflation_rate=inflation_rate, 
+            apply_income_tax=apply_income_tax_bool,
+            apply_inflation_to_income=apply_inflation_to_income, 
+            apply_inflation_to_expenses=apply_inflation_to_expenses,
+            apply_inflation_to_rent=apply_inflation_to_rent,
+            max_search_months=120,  # Limit search to 10 years to keep runtime reasonable
+            test_mode=False  # Use full search mode for the UI
+        )
+        
+        # Create a card to display the results
+        result_card = dbc.Card([
+            dbc.CardHeader("Optimal Strategy Results"),
+            dbc.CardBody([
+                html.H5("Recommended Strategy", className="text-success"),
+                
+                # House selling strategy
+                html.P([
+                    html.Strong("House Selling: "), 
+                    "Don't sell" if optimal_strategy["house_sell_month"] == -1 else 
+                    f"Sell in month {optimal_strategy['house_sell_month']} ({optimal_strategy['house_sell_month'] // 12} years, {optimal_strategy['house_sell_month'] % 12} months)"
+                    + (" with proceeds to mortgage" if optimal_strategy["house_sale_to_mortgage"] else " with proceeds to savings")
+                ]),
+                
+                # Securities selling strategy
+                html.P([
+                    html.Strong("Securities Selling: "),
+                    "Don't sell" if optimal_strategy["securities_sell_month"] == 0 and optimal_strategy["securities_monthly_sell"] == 0 else
+                    f"Sell all at once in month {optimal_strategy['securities_sell_month']} ({optimal_strategy['securities_sell_month'] // 12} years, {optimal_strategy['securities_sell_month'] % 12} months)" if optimal_strategy["securities_sell_month"] > 0 else
+                    f"Sell ${optimal_strategy['securities_monthly_sell']:.2f} monthly"
+                ]),
+                
+                # Performance details
+                html.Hr(),
+                html.P([
+                    html.Strong("Best Performing Model: "), 
+                    optimal_strategy["strategy_name"]
+                ]),
+                html.P([
+                    html.Strong("Final Net Worth: "), 
+                    f"${optimal_strategy['final_net_worth']:,.2f}"
+                ]),
+                html.P([
+                    html.Strong("Total Tax Paid: "), 
+                    f"${optimal_strategy['tax_paid']:,.2f}"
+                ]),
+                
+                # Apply buttons
+                html.Hr(),
+                html.P("Apply this strategy to your calculator:"),
+                dbc.Button(
+                    "Apply Optimal Strategy", 
+                    id="apply-optimal-strategy", 
+                    color="primary", 
+                    className="w-100 mb-2",
+                    n_clicks=0  # Initialize click counter
+                ),
+                
+                # Store the optimization results as JSON in a hidden div
+                html.Div(
+                    id="hidden-optimization-results",
+                    style={"display": "none"},
+                    children=json.dumps(optimal_strategy)
+                ),
+            ]),
+        ], className="mt-3")
+        
+        return result_card
+    
+    except Exception as e:
+        # Return error message if optimization fails
+        return html.Div([
+            html.P("Optimization failed with error:", className="text-danger"),
+            html.Pre(str(e), className="border p-2")
+        ])
+
+# Callback to apply the optimal strategy
+@app.callback(
+    [Output("existing-house-sell-month", "value"),
+     Output("existing-house-sale-destination", "value"),
+     Output("securities-sell-month", "value"),
+     Output("securities-monthly-sell", "value")],
+    Input("apply-optimal-strategy", "n_clicks"),
+    State("hidden-optimization-results", "children"),
+    prevent_initial_call=True,
+)
+def apply_optimal_strategy(n_clicks, optimization_results_json):
+    """Apply the optimal strategy to the calculator inputs."""
+    if n_clicks is None or n_clicks <= 0 or not optimization_results_json:
+        raise dash.exceptions.PreventUpdate
+        
+    # Parse the optimization results from JSON
+    optimal_strategy = json.loads(optimization_results_json)
+    
+    # Convert the boolean house_sale_to_mortgage to the radio button value
+    house_sale_destination = "mortgage" if optimal_strategy.get("house_sale_to_mortgage", False) else "savings"
+    
+    # Apply the optimal strategy values
+    return (
+        optimal_strategy["house_sell_month"],
+        house_sale_destination,
+        optimal_strategy["securities_sell_month"],
+        optimal_strategy["securities_monthly_sell"]
+    )
 
 # Run the app
 if __name__ == "__main__":

@@ -84,7 +84,7 @@ class TestMortgageCalculator(unittest.TestCase):
             principal=300000, annual_rate=0.045, term_years=30,
             monthly_income=6000, monthly_expenses=3000,
             existing_house_value=200000, existing_house_sell_month=24,
-            existing_house_rent_income=1500, existing_house_sale_to_securities=False,
+            existing_house_rent_income=1500, existing_house_sale_to_mortgage=False,
             existing_house_purchase_price=150000,  # Add purchase price
             securities_value=100000, securities_growth_rate=0.07, securities_sell_month=60,
             securities_monthly_sell=0,
@@ -141,7 +141,7 @@ class TestMortgageCalculator(unittest.TestCase):
             principal=300000, annual_rate=0.045, term_years=30,
             monthly_income=5000, monthly_expenses=3000,
             existing_house_value=200000, existing_house_sell_month=-1,
-            existing_house_rent_income=0, existing_house_sale_to_securities=False,
+            existing_house_rent_income=0, existing_house_sale_to_mortgage=False,
             securities_value=0, securities_growth_rate=0,
             savings_initial=0, savings_interest_rate=0,
         )
@@ -186,7 +186,7 @@ class TestMortgageCalculator(unittest.TestCase):
             principal=300000, annual_rate=0.045, term_years=30,
             monthly_income=6000, monthly_expenses=3000,
             existing_house_value=200000, existing_house_sell_month=24,
-            existing_house_rent_income=1500, existing_house_sale_to_securities=False,
+            existing_house_rent_income=1500, existing_house_sale_to_mortgage=False,
             securities_value=100000, securities_growth_rate=0.07, securities_sell_month=60,
             securities_monthly_sell=0,
             savings_initial=50000, savings_interest_rate=0.02,
@@ -490,7 +490,7 @@ class TestMortgageCalculator(unittest.TestCase):
             existing_house_value=200000,
             existing_house_purchase_price=150000,  # Add purchase price
             existing_house_sell_month=60,  # Sell after 5 years
-            existing_house_sale_to_securities=False,  # Apply to mortgage principal
+            existing_house_sale_to_mortgage=False,  # Apply to savings account
             home_appreciation_rate=0.03,
             existing_house_appreciation_rate=0.04,  # 4% for existing house
             apply_income_tax=False,  # Explicitly disable income tax
@@ -613,6 +613,36 @@ class TestMortgageCalculator(unittest.TestCase):
         # But combined effect should be greater than just appreciation
         self.assertTrue(comp_both["Income_Net_Worth"].iloc[-1] >= comp_appreciation_only["Income_Net_Worth"].iloc[-1])
 
+    def test_optimization_function(self):
+        """Test that the optimization function works correctly."""
+        from mortgage_calculator import find_optimal_strategy
+        
+        # Define a simple scenario for testing (use minimal parameters to speed up test)
+        optimal_strategy = find_optimal_strategy(
+            principal=300000, annual_rate=4.5, term_years=1,  # Only test 1 year to speed up test
+            monthly_income=6000, monthly_expenses=3000,
+            existing_house_value=200000, existing_house_purchase_price=150000,
+            existing_house_appreciation_rate=3.0, existing_house_rent_income=1500,
+            securities_value=100000, securities_growth_rate=7.0, securities_quarterly_dividend=750,
+            savings_initial=50000, savings_interest_rate=1.5,
+            home_appreciation_rate=3.0, inflation_rate=2.0,
+            apply_income_tax=True, 
+            max_search_months=12,  # Only look at first year to speed up test
+            test_mode=True,  # Enable test mode to limit combinations
+        )
+        
+        # Verify the structure of the returned strategy
+        self.assertIsInstance(optimal_strategy, dict)
+        
+        # Check all expected keys exist
+        expected_keys = ["house_sell_month", "securities_sell_month", "securities_monthly_sell", 
+                         "final_net_worth", "strategy_name", "tax_paid"]
+        for key in expected_keys:
+            self.assertIn(key, optimal_strategy)
+        
+        # Verify that the final net worth is a positive number
+        self.assertGreater(optimal_strategy["final_net_worth"], 0)
+    
     def test_capital_gains_tax_calculation(self):
         """Test that capital gains tax is calculated correctly."""
         from mortgage_calculator import calculate_house_capital_gains_tax
@@ -665,6 +695,61 @@ class TestMortgageCalculator(unittest.TestCase):
         # Allow some variance due to interest calculations and implementation details
         self.assertTrue(actual_increase > 800000,
                      f"Savings should increase by approximately ${expected_increase}, but only increased by ${actual_increase}")
+        
+    def test_house_sale_to_mortgage(self):
+        """Test that house sale proceeds can be applied to mortgage principal."""
+        # Test case: house sale with proceeds to mortgage
+        comparison_df_to_mortgage = create_comparison_data(
+            principal=300000, annual_rate=0.045, term_years=30,
+            monthly_income=6000, monthly_expenses=3000,
+            existing_house_value=200000, 
+            existing_house_purchase_price=150000,
+            existing_house_sell_month=12,  # Sell after 1 year
+            existing_house_sale_to_mortgage=True,  # Apply proceeds to mortgage
+            existing_house_rent_income=0,
+            existing_house_appreciation_rate=0.0,  # No appreciation for simplicity
+            apply_income_tax=False  # No tax for simplicity
+        )
+        
+        # Test case: identical setup but proceeds to savings
+        comparison_df_to_savings = create_comparison_data(
+            principal=300000, annual_rate=0.045, term_years=30,
+            monthly_income=6000, monthly_expenses=3000,
+            existing_house_value=200000, 
+            existing_house_purchase_price=150000,
+            existing_house_sell_month=12,  # Sell after 1 year
+            existing_house_sale_to_mortgage=False,  # Apply proceeds to savings
+            existing_house_rent_income=0,
+            existing_house_appreciation_rate=0.0,  # No appreciation for simplicity
+            apply_income_tax=False  # No tax for simplicity
+        )
+        
+        # Check loan balance impact
+        balance_before_sale = comparison_df_to_mortgage[comparison_df_to_mortgage["Month"] == 11]["House_Sell_Balance"].iloc[0]
+        balance_after_sale_to_mortgage = comparison_df_to_mortgage[comparison_df_to_mortgage["Month"] == 12]["House_Sell_Balance"].iloc[0]
+        balance_after_sale_to_savings = comparison_df_to_savings[comparison_df_to_savings["Month"] == 12]["House_Sell_Balance"].iloc[0]
+        
+        # When proceeds go to mortgage, the balance should decrease significantly
+        self.assertTrue(balance_after_sale_to_mortgage < balance_after_sale_to_savings,
+                      "Balance should be lower when house sale proceeds are applied to mortgage")
+        
+        # The balance reduction should be approximately equal to the house value
+        balance_reduction = balance_before_sale - balance_after_sale_to_mortgage
+        self.assertTrue(balance_reduction > 190000,  # Allow some variance but it should be close to 200000
+                      f"Balance reduction should be close to house value, but was only ${balance_reduction}")
+        
+        # Check savings impact
+        savings_after_sale_to_mortgage = comparison_df_to_mortgage[comparison_df_to_mortgage["Month"] == 12]["House_Sell_Savings"].iloc[0]
+        savings_after_sale_to_savings = comparison_df_to_savings[comparison_df_to_savings["Month"] == 12]["House_Sell_Savings"].iloc[0]
+        
+        # When proceeds go to savings, savings should be higher
+        self.assertTrue(savings_after_sale_to_savings > savings_after_sale_to_mortgage,
+                      "Savings should be higher when house sale proceeds are applied to savings")
+        
+        # The difference should be approximately equal to the house value
+        savings_difference = savings_after_sale_to_savings - savings_after_sale_to_mortgage
+        self.assertTrue(savings_difference > 190000,  # Allow some variance but it should be close to 200000
+                      f"Savings difference should be close to house value, but was only ${savings_difference}")
         
     def test_scenario_storage_and_comparison(self):
         """Test the scenario storage and comparison functionality."""
