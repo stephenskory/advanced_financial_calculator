@@ -1,0 +1,10 @@
+Write an interactive mortgage calculator using Python, Plotly, and Dash that compares the choices of funding the payments for a mortgage using one or more of:
+
+* Normal earned income
+* Selling an existing house
+* Renting an existing house
+* Pledged asset mortgage
+* Selling securities
+
+Please include adjustable parameters for the mortgage and all funding sources.
+Output relevant graphs and plots, including a plot showing overall net worth given the starting parameters.
