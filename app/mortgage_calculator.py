@@ -39,6 +39,39 @@ def calculate_income_tax(annual_income, brackets=TAX_BRACKETS_MFJ):
     
     return total_tax
 
+# Function to calculate capital gains tax on house sale for married filing jointly
+def calculate_house_capital_gains_tax(sale_price, purchase_price, brackets=TAX_BRACKETS_MFJ):
+    """
+    Calculate capital gains tax on house sale, accounting for the $500,000 exemption for married filing jointly.
+    
+    Args:
+        sale_price: The sale price of the house
+        purchase_price: The original purchase price of the house
+        
+    Returns:
+        Tuple of (capital_gains_tax, net_proceeds)
+    """
+    # Ensure values are floats
+    sale_price = float(sale_price)
+    purchase_price = float(purchase_price)
+    
+    # Calculate capital gain
+    capital_gain = max(0, sale_price - purchase_price)
+    
+    # Apply $500,000 exemption for married filing jointly
+    exemption = 500000
+    taxable_gain = max(0, capital_gain - exemption)
+    
+    # Capital gains are generally taxed at 15% but can vary
+    # For simplicity, we'll use a flat 15% rate for all gains
+    capital_gains_tax_rate = 0.15
+    capital_gains_tax = taxable_gain * capital_gains_tax_rate
+    
+    # Calculate net proceeds after tax
+    net_proceeds = sale_price - capital_gains_tax
+    
+    return capital_gains_tax, net_proceeds
+
 # Mortgage calculator functions
 def calculate_mortgage_payment(principal, annual_rate, term_years):
     """Calculate the monthly mortgage payment."""
@@ -182,6 +215,7 @@ def create_comparison_data(
     monthly_income, monthly_expenses,
     existing_house_value=0, existing_house_sell_month=-1,
     existing_house_rent_income=0, existing_house_sale_to_securities=False,
+    existing_house_purchase_price=0,  # Purchase price of existing house (for capital gains calculation)
     existing_house_appreciation_rate=0.03,  # Default 3% annual appreciation for existing house
     securities_value=0, securities_growth_rate=0, securities_sell_month=0,
     securities_monthly_sell=0,  # Amount of securities to sell per month
@@ -210,6 +244,8 @@ def create_comparison_data(
         monthly_expenses = 0
     if existing_house_value is None:
         existing_house_value = 0
+    if existing_house_purchase_price is None:
+        existing_house_purchase_price = 0
     if existing_house_sell_month is None:
         existing_house_sell_month = -1
     if existing_house_rent_income is None:
@@ -252,6 +288,7 @@ def create_comparison_data(
     monthly_income = float(monthly_income)
     monthly_expenses = float(monthly_expenses)
     existing_house_value = float(existing_house_value)
+    existing_house_purchase_price = float(existing_house_purchase_price)
     existing_house_rent_income = float(existing_house_rent_income)
     existing_house_appreciation_rate = float(existing_house_appreciation_rate)
     securities_value = float(securities_value)
@@ -369,7 +406,7 @@ def create_comparison_data(
         
         # Calculate quarterly dividends for this month, if applicable
         if is_dividend_month(month) and securities_quarterly_dividend > 0:
-            # Calculate dividend amount (proportional to current securities value)
+            # Base dividend will be scaled later for each strategy based on remaining securities value
             securities_quarterly_dividend_paid[month] = securities_quarterly_dividend
         else:
             securities_quarterly_dividend_paid[month] = 0
@@ -384,11 +421,17 @@ def create_comparison_data(
         new_balance = max(0, prev_balance - principal_payment)
         income_remaining_balance[month] = new_balance
         
-        # Get dividend for this month
-        current_dividend = securities_quarterly_dividend_paid[month]
-
         # Update securities with growth rate
         income_securities_value[month] = income_securities_value[month-1] * (1 + securities_growth_rate / 12)
+        
+        # Scale dividend based on remaining securities value (percentage of original value)
+        # For the income strategy, no securities are sold so we use the full dividend amount
+        dividend_scale_factor = 1.0
+        if securities_value > 0:
+            dividend_scale_factor = income_securities_value[month] / securities_value
+            
+        # Get scaled dividend for this month
+        current_dividend = securities_quarterly_dividend_paid[month] * dividend_scale_factor
         
         # Calculate pre-tax income
         total_monthly_pretax_income = inflation_adjusted_income[month] + current_dividend
@@ -440,11 +483,16 @@ def create_comparison_data(
         # Strategy 2: Sell existing house
         prev_balance = house_sell_remaining_balance[month-1]
         
-        # Get dividend for this month
-        current_dividend = securities_quarterly_dividend_paid[month]
-
         # Update securities with growth rate
         house_sell_securities_value[month] = house_sell_securities_value[month-1] * (1 + securities_growth_rate / 12)
+        
+        # Scale dividend based on remaining securities value (percentage of original value)
+        dividend_scale_factor = 1.0
+        if securities_value > 0:
+            dividend_scale_factor = house_sell_securities_value[month] / securities_value
+            
+        # Get scaled dividend for this month
+        current_dividend = securities_quarterly_dividend_paid[month] * dividend_scale_factor
 
         interest_payment = prev_balance * (annual_rate / 12)
         principal_payment = monthly_payment - interest_payment
@@ -489,8 +537,19 @@ def create_comparison_data(
             # Get the current value of the existing house with appreciation
             current_existing_house_value = existing_house_values[month]
             
-            # Add house sale proceeds to savings (could add capital gains tax here in the future)
-            house_sell_savings_value[month] += current_existing_house_value
+            # Calculate capital gains tax if applicable
+            if apply_income_tax and existing_house_purchase_price > 0:
+                capital_gains_tax, net_proceeds = calculate_house_capital_gains_tax(
+                    current_existing_house_value, existing_house_purchase_price
+                )
+                # Add the house sale proceeds net of tax to savings
+                house_sell_savings_value[month] += net_proceeds
+                
+                # Record the capital gains tax in the monthly tax amount
+                house_sell_tax_paid[month] += capital_gains_tax
+            else:
+                # No tax, add the full proceeds to savings
+                house_sell_savings_value[month] += current_existing_house_value
 
         # Add monthly leftovers to savings
         if monthly_leftover > 0:
@@ -514,11 +573,16 @@ def create_comparison_data(
         prev_balance = rent_remaining_balance[month-1]
         interest_payment = prev_balance * (annual_rate / 12)
         
-        # Get dividend for this month
-        current_dividend = securities_quarterly_dividend_paid[month]
-
         # Update securities with growth rate
         rent_securities_value[month] = rent_securities_value[month-1] * (1 + securities_growth_rate / 12)
+        
+        # Scale dividend based on remaining securities value (percentage of original value)
+        dividend_scale_factor = 1.0
+        if securities_value > 0:
+            dividend_scale_factor = rent_securities_value[month] / securities_value
+            
+        # Get scaled dividend for this month
+        current_dividend = securities_quarterly_dividend_paid[month] * dividend_scale_factor
         
         # Calculate pre-tax income (now including rental income)
         total_monthly_pretax_income = inflation_adjusted_income[month] + inflation_adjusted_rent[month] + current_dividend
@@ -580,9 +644,6 @@ def create_comparison_data(
         # Strategy 4: Sell securities
         prev_balance = securities_remaining_balance[month-1]
         interest_payment = prev_balance * (annual_rate / 12)
-        
-        # Get dividend for this month
-        current_dividend = securities_quarterly_dividend_paid[month]
 
         # Get securities value from previous month
         temp_securities_value = securities_securities_value[month-1]
@@ -611,6 +672,15 @@ def create_comparison_data(
 
         # Store the updated securities value
         securities_securities_value[month] = temp_securities_value
+        
+        # Scale dividend based on remaining securities value (percentage of original value)
+        # This is crucial for securities strategy since we're actively selling securities
+        dividend_scale_factor = 1.0
+        if securities_value > 0:
+            dividend_scale_factor = temp_securities_value / securities_value
+            
+        # Get scaled dividend for this month - only pay dividends on remaining securities
+        current_dividend = securities_quarterly_dividend_paid[month] * dividend_scale_factor
         
         # Calculate pre-tax income (including capital gains from securities sales)
         total_monthly_pretax_income = inflation_adjusted_income[month] + current_dividend
@@ -674,9 +744,6 @@ def create_comparison_data(
         prev_balance = combo_remaining_balance[month-1]
         interest_payment = prev_balance * (annual_rate / 12)
         
-        # Get dividend for this month
-        current_dividend = securities_quarterly_dividend_paid[month]
-        
         # Get securities value from previous month
         temp_securities_value = combo_securities_value[month-1]
         
@@ -705,9 +772,39 @@ def create_comparison_data(
         # Store the updated securities value
         combo_securities_value[month] = temp_securities_value
         
+        # Scale dividend based on remaining securities value (percentage of original value)
+        dividend_scale_factor = 1.0
+        if securities_value > 0:
+            dividend_scale_factor = temp_securities_value / securities_value
+            
+        # Get scaled dividend for this month - only pay dividends on remaining securities
+        current_dividend = securities_quarterly_dividend_paid[month] * dividend_scale_factor
+        
         # Check if the existing house is still owned (not sold)
         house_is_owned = True
-        if existing_house_sell_month >= 0 and month >= existing_house_sell_month:
+        
+        # Process house sale if this is the sale month
+        if existing_house_sell_month >= 0 and month == existing_house_sell_month:
+            # Get the current value of the existing house with appreciation
+            current_existing_house_value = existing_house_values[month]
+            
+            # Calculate capital gains tax if applicable
+            if apply_income_tax and existing_house_purchase_price > 0:
+                capital_gains_tax, net_proceeds = calculate_house_capital_gains_tax(
+                    current_existing_house_value, existing_house_purchase_price
+                )
+                # Add the house sale proceeds net of tax to savings
+                combo_savings_value[month] += net_proceeds
+                
+                # Record the capital gains tax in the monthly tax amount
+                combo_tax_paid[month] += capital_gains_tax
+            else:
+                # No tax, add the full proceeds to savings
+                combo_savings_value[month] += current_existing_house_value
+                
+            # House is no longer owned after this month    
+            house_is_owned = False
+        elif existing_house_sell_month >= 0 and month > existing_house_sell_month:
             house_is_owned = False
             
         # Calculate rental income (only if house is still owned)
@@ -894,6 +991,10 @@ app.layout = dbc.Container([
                 dbc.CardBody([
                     html.Label("Current Value ($)"),
                     dcc.Input(id="existing-house-value", type="number", value=200000, min=0, step=10000, className="mb-2 form-control"),
+                    
+                    html.Label("Purchase Price ($)"),
+                    dcc.Input(id="existing-house-purchase-price", type="number", value=150000, min=0, step=10000, className="mb-2 form-control"),
+                    html.P("Used to calculate capital gains tax with $500,000 married exemption", className="text-muted mb-2"),
 
                     html.Label("Annual Appreciation Rate (%)"),
                     dcc.Input(id="existing-house-appreciation-rate", type="number", value=3.0, min=0, max=10, step=0.1, className="mb-2 form-control"),
@@ -901,7 +1002,7 @@ app.layout = dbc.Container([
                     html.Label("Sell in Month # (negative = don't sell)"),
                     dcc.Input(id="existing-house-sell-month", type="number", value=-1, min=-1, step=1, className="mb-2 form-control"),
 
-                    html.P("Sale proceeds are automatically added to savings account", className="text-muted mb-2"),
+                    html.P("Sale proceeds (minus capital gains tax if applicable) are added to savings account", className="text-muted mb-2"),
 
                     html.Label("Monthly Rental Income ($)"),
                     dcc.Input(id="existing-house-rent", type="number", value=1500, min=0, step=100, className="mb-2 form-control"),
@@ -1148,6 +1249,7 @@ app.layout = dbc.Container([
      State("monthly-income", "value"),
      State("monthly-expenses", "value"),
      State("existing-house-value", "value"),
+     State("existing-house-purchase-price", "value"),
      State("existing-house-appreciation-rate", "value"),
      State("existing-house-sell-month", "value"),
      State("existing-house-rent", "value"),
@@ -1166,8 +1268,8 @@ app.layout = dbc.Container([
 )
 def update_results(n_clicks, principal, annual_rate, term_years,
                   monthly_income, monthly_expenses,
-                  existing_house_value, existing_house_appreciation_rate, existing_house_sell_month,
-                  existing_house_rent, savings_initial, savings_interest_rate,
+                  existing_house_value, existing_house_purchase_price, existing_house_appreciation_rate, 
+                  existing_house_sell_month, existing_house_rent, savings_initial, savings_interest_rate,
                   securities_value, securities_growth_rate, securities_sell_month, securities_monthly_sell,
                   securities_quarterly_dividend, securities_dividend_to_savings, apply_income_tax,
                   appreciation_rate, inflation_rate, inflation_apply_to):
@@ -1198,6 +1300,7 @@ def update_results(n_clicks, principal, annual_rate, term_years,
         principal, annual_rate_decimal, term_years,
         monthly_income, monthly_expenses,
         existing_house_value, existing_house_sell_month, existing_house_rent, False,
+        existing_house_purchase_price,  # Purchase price for capital gains calculation
         existing_house_appreciation_rate_decimal,
         securities_value, securities_growth_rate_decimal, securities_sell_month, securities_monthly_sell,
         securities_quarterly_dividend, securities_dividend_to_savings_bool,
@@ -1922,9 +2025,21 @@ def update_results(n_clicks, principal, annual_rate, term_years,
                     dbc.CardHeader("Selling Existing House Strategy"),
                     dbc.CardBody([
                         html.P(f"Initial House Value: ${existing_house_value if existing_house_value is not None else 0:.2f}"),
+                        html.P(f"Purchase Price: ${existing_house_purchase_price if existing_house_purchase_price is not None else 0:.2f}"),
                         html.P(f"Annual Appreciation Rate: {existing_house_appreciation_rate if existing_house_appreciation_rate is not None else 3.0}%"),
                         html.P(f"Final Value Before Sale: ${comparison_df['Existing_House_Value'].iloc[-1]:.2f}"),
                         html.P(f"Sale Month: {existing_house_sell_month}" if existing_house_sell_month is not None and existing_house_sell_month >= 0 else "Not Planning to Sell"),
+                        
+                        # Calculate potential capital gains tax if house is sold
+                        html.Div([
+                            html.P("Capital Gains Tax Analysis:", className="font-weight-bold"),
+                            html.P(f"Potential Gain: ${max(0, comparison_df['Existing_House_Value'].iloc[-1] - existing_house_purchase_price):.2f}"),
+                            html.P("Married Exemption: $500,000"),
+                            html.P(f"Taxable Amount: ${max(0, comparison_df['Existing_House_Value'].iloc[-1] - existing_house_purchase_price - 500000):.2f}"),
+                            html.P(f"Estimated Tax (15% rate): ${max(0, comparison_df['Existing_House_Value'].iloc[-1] - existing_house_purchase_price - 500000) * 0.15:.2f}"),
+                            html.P(f"Net Proceeds After Tax: ${comparison_df['Existing_House_Value'].iloc[-1] - max(0, comparison_df['Existing_House_Value'].iloc[-1] - existing_house_purchase_price - 500000) * 0.15:.2f}"),
+                        ]) if existing_house_sell_month is not None and existing_house_sell_month >= 0 and apply_income_tax_bool else html.P("Capital Gains Tax: Not Applied"),
+                        
                         html.P("Proceeds Go To: Savings Account"),
                         html.P(f"Net Worth After {safe_term_years} Years: ${comparison_df['House_Sell_Net_Worth'].iloc[-1]:.2f}"),
                     ]),
@@ -2038,6 +2153,7 @@ def update_results(n_clicks, principal, annual_rate, term_years,
      State("monthly-income", "value"),
      State("monthly-expenses", "value"),
      State("existing-house-value", "value"),
+     State("existing-house-purchase-price", "value"),
      State("existing-house-appreciation-rate", "value"),
      State("existing-house-sell-month", "value"),
      State("existing-house-rent", "value"),
@@ -2056,7 +2172,7 @@ def update_results(n_clicks, principal, annual_rate, term_years,
     prevent_initial_call=True,
 )
 def save_scenario(n_clicks, scenario_name, principal, annual_rate, term_years,
-                 monthly_income, monthly_expenses, existing_house_value,
+                 monthly_income, monthly_expenses, existing_house_value, existing_house_purchase_price,
                  existing_house_appreciation_rate, existing_house_sell_month,
                  existing_house_rent, savings_initial, savings_interest_rate,
                  securities_value, securities_growth_rate, securities_sell_month,
@@ -2073,6 +2189,7 @@ def save_scenario(n_clicks, scenario_name, principal, annual_rate, term_years,
         "monthly_income": monthly_income,
         "monthly_expenses": monthly_expenses,
         "existing_house_value": existing_house_value,
+        "existing_house_purchase_price": existing_house_purchase_price,
         "existing_house_appreciation_rate": existing_house_appreciation_rate,
         "existing_house_sell_month": existing_house_sell_month,
         "existing_house_rent": existing_house_rent,
@@ -2136,6 +2253,7 @@ def delete_scenario(n_clicks, scenario_name):
      Output("monthly-income", "value"),
      Output("monthly-expenses", "value"),
      Output("existing-house-value", "value"),
+     Output("existing-house-purchase-price", "value"),
      Output("existing-house-appreciation-rate", "value"),
      Output("existing-house-sell-month", "value"),
      Output("existing-house-rent", "value"),
@@ -2158,7 +2276,7 @@ def delete_scenario(n_clicks, scenario_name):
 )
 def load_scenario(n_clicks, scenario_name):
     if not scenario_name:
-        return [dash.no_update] * 21 + [html.P("Please select a scenario to load", className="text-danger")]
+        return [dash.no_update] * 22 + [html.P("Please select a scenario to load", className="text-danger")]
 
     if scenario_name in stored_scenarios:
         scenario = stored_scenarios[scenario_name]
@@ -2170,6 +2288,8 @@ def load_scenario(n_clicks, scenario_name):
             scenario["securities_dividend_to_savings"] = ["dividend-to-savings"]
         if "apply_income_tax" not in scenario:
             scenario["apply_income_tax"] = ["apply-tax"]
+        if "existing_house_purchase_price" not in scenario:
+            scenario["existing_house_purchase_price"] = 0
         
         return [
             scenario["principal"],
@@ -2178,6 +2298,7 @@ def load_scenario(n_clicks, scenario_name):
             scenario["monthly_income"],
             scenario["monthly_expenses"],
             scenario["existing_house_value"],
+            scenario["existing_house_purchase_price"],
             scenario["existing_house_appreciation_rate"],
             scenario["existing_house_sell_month"],
             scenario["existing_house_rent"],
@@ -2195,7 +2316,7 @@ def load_scenario(n_clicks, scenario_name):
             scenario["inflation_apply_to"],
             html.P(f"Scenario '{scenario_name}' loaded successfully!", className="text-success"),
         ]
-    return [dash.no_update] * 21 + [html.P(f"Scenario '{scenario_name}' not found", className="text-danger")]
+    return [dash.no_update] * 22 + [html.P(f"Scenario '{scenario_name}' not found", className="text-danger")]
 
 @app.callback(
     [Output("scenario-comparison-graph", "figure"),
@@ -2228,6 +2349,7 @@ def update_scenario_comparison(scenario1, scenario2, metric):
     s1_securities_quarterly_dividend = s1.get("securities_quarterly_dividend", 0)
     s1_securities_dividend_to_savings = "dividend-to-savings" in s1.get("securities_dividend_to_savings", [])
     s1_apply_income_tax = "apply-tax" in s1.get("apply_income_tax", [])
+    s1_existing_house_purchase_price = s1.get("existing_house_purchase_price", 0)
     
     # All proceeds go to savings (house_sale_to_securities is always False)
     s1_house_sale_to_securities = False
@@ -2236,6 +2358,7 @@ def update_scenario_comparison(scenario1, scenario2, metric):
         s1["principal"], s1_annual_rate, s1["term_years"],
         s1["monthly_income"], s1["monthly_expenses"],
         s1["existing_house_value"], s1["existing_house_sell_month"], s1["existing_house_rent"], s1_house_sale_to_securities,
+        s1_existing_house_purchase_price,  # Purchase price for capital gains
         s1_existing_house_appreciation_rate,
         s1["securities_value"], s1_securities_growth_rate, s1["securities_sell_month"], s1["securities_monthly_sell"],
         s1_securities_quarterly_dividend, s1_securities_dividend_to_savings,
@@ -2261,6 +2384,7 @@ def update_scenario_comparison(scenario1, scenario2, metric):
     s2_securities_quarterly_dividend = s2.get("securities_quarterly_dividend", 0)
     s2_securities_dividend_to_savings = "dividend-to-savings" in s2.get("securities_dividend_to_savings", [])
     s2_apply_income_tax = "apply-tax" in s2.get("apply_income_tax", [])
+    s2_existing_house_purchase_price = s2.get("existing_house_purchase_price", 0)
     
     # All proceeds go to savings (house_sale_to_securities is always False)
     s2_house_sale_to_securities = False
@@ -2269,6 +2393,7 @@ def update_scenario_comparison(scenario1, scenario2, metric):
         s2["principal"], s2_annual_rate, s2["term_years"],
         s2["monthly_income"], s2["monthly_expenses"],
         s2["existing_house_value"], s2["existing_house_sell_month"], s2["existing_house_rent"], s2_house_sale_to_securities,
+        s2_existing_house_purchase_price,  # Purchase price for capital gains
         s2_existing_house_appreciation_rate,
         s2["securities_value"], s2_securities_growth_rate, s2["securities_sell_month"], s2["securities_monthly_sell"],
         s2_securities_quarterly_dividend, s2_securities_dividend_to_savings,
@@ -2357,6 +2482,9 @@ def update_scenario_comparison(scenario1, scenario2, metric):
                 html.Tr([html.Td("Term Years"), html.Td(s1["term_years"]), html.Td(s2["term_years"])]),
                 html.Tr([html.Td("Monthly Income"), html.Td(f"${s1['monthly_income']:,.2f}"), html.Td(f"${s2['monthly_income']:,.2f}")]),
                 html.Tr([html.Td("Monthly Expenses"), html.Td(f"${s1['monthly_expenses']:,.2f}"), html.Td(f"${s2['monthly_expenses']:,.2f}")]),
+                html.Tr([html.Td("Existing House Value"), html.Td(f"${s1['existing_house_value']:,.2f}"), html.Td(f"${s2['existing_house_value']:,.2f}")]),
+                html.Tr([html.Td("House Purchase Price"), html.Td(f"${s1_existing_house_purchase_price:,.2f}"), html.Td(f"${s2_existing_house_purchase_price:,.2f}")]),
+                html.Tr([html.Td("House Sell Month"), html.Td(s1["existing_house_sell_month"]), html.Td(s2["existing_house_sell_month"])]),
                 html.Tr([html.Td("Quarterly Dividend"), html.Td(f"${s1_securities_quarterly_dividend:,.2f}"), html.Td(f"${s2_securities_quarterly_dividend:,.2f}")]),
                 html.Tr([html.Td("Income Tax Applied"), html.Td("Yes" if s1_apply_income_tax else "No"), html.Td("Yes" if s2_apply_income_tax else "No")]),
                 html.Tr([html.Td("Inflation Rate"), html.Td(f"{s1['inflation_rate']}%"), html.Td(f"{s2['inflation_rate']}%")]),
