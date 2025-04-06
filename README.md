@@ -1,5 +1,9 @@
 # Advanced Mortgage Funding Calculator
 
+> [!NOTE]  
+> This code was primarily written by [Claude Code](https://ai-claude.net/code/),
+> not me, Stephen Skory, who is human.
+
 An interactive dashboard that compares different strategies for funding a mortgage, including:
 
 * Normal earned income
